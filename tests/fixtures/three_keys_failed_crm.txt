@@ -1,0 +1,87 @@
+Initial State
+u0 = 0
+Initial Counters
+c0 = (1, 1, 1)
+State Transitions
+State 0
+    GREEN_KEY / (NZ) -> 1
+    BLUE_KEY / (-) -> 0
+    RED_KEY / (-) -> 0
+    GOAL / (-) -> 0
+    / (-) -> 0
+State 1
+    BLUE_KEY / (NZ) -> 2
+    GREEN_KEY / (-) -> 1
+    RED_KEY / (-) -> 1
+    GOAL / (-) -> 1
+    / (-) -> 1
+State 2
+    RED_KEY / (NZ) -> 3
+    GREEN_KEY / (-) -> 2
+    BLUE_KEY / (-) -> 2
+    GOAL / (-) -> 2
+    / (-) -> 2
+State 3
+    GOAL / (Z) -> 4
+    GREEN_KEY / (-) -> 3
+    BLUE_KEY / (-) -> 3
+    RED_KEY / (-) -> 3
+    / (-) -> 3
+State 4
+    / (-) -> -1
+
+Counter Transitions
+State 0
+    GREEN_KEY / (NZ) -> (-1, 0, 0)
+    BLUE_KEY / (-) -> (0, 0, 0)
+    RED_KEY / (-) -> (0, 0, 0)
+    GOAL / (-) -> (0, 0, 0)
+    / (-) -> (0, 0, 0)
+State 1
+    BLUE_KEY / (NZ) -> (0, -1, 0)
+    GREEN_KEY / (-) -> (0, 0, 0)
+    RED_KEY / (-) -> (0, 0, 0)
+    GOAL / (-) -> (0, 0, 0)
+    / (-) -> (0, 0, 0)
+State 2
+    RED_KEY / (NZ) -> (0, 0, -1)
+    GREEN_KEY / (-) -> (0, 0, 0)
+    BLUE_KEY / (-) -> (0, 0, 0)
+    GOAL / (-) -> (0, 0, 0)
+    / (-) -> (0, 0, 0)
+State 3
+    GOAL / (Z) -> (0, 0, 0)
+    GREEN_KEY / (-) -> (0, 0, 0)
+    BLUE_KEY / (-) -> (0, 0, 0)
+    RED_KEY / (-) -> (0, 0, 0)
+    / (-) -> (0, 0, 0)
+State 4
+    / (-) -> (0, 0, 0)
+
+Reward Transitions
+State 0
+    GREEN_KEY / (NZ) -> 1.0
+    BLUE_KEY / (-) -> -10.0
+    RED_KEY / (-) -> -10.0
+    GOAL / (-) -> -10.0
+    / (-) -> -0.01
+State 1
+    BLUE_KEY / (NZ) -> 1.0
+    GREEN_KEY / (-) -> -10.0
+    RED_KEY / (-) -> -10.0
+    GOAL / (-) -> -10.0
+    / (-) -> -0.01
+State 2
+    RED_KEY / (NZ) -> 1.0
+    GREEN_KEY / (-) -> -10.0
+    BLUE_KEY / (-) -> -10.0
+    GOAL / (-) -> -10.0
+    / (-) -> -0.01
+State 3
+    GOAL / (Z) -> 10.0
+    GREEN_KEY / (-) -> -10.0
+    BLUE_KEY / (-) -> -10.0
+    RED_KEY / (-) -> -10.0
+    / (-) -> -0.01
+State 4
+    / (-) -> 0.0

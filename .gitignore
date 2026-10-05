@@ -1,0 +1,28 @@
+# Python environments and caches
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+CopyPastas.txt
+LLMs.txt
+.aws/
+.codex/
+.agents/
+.vscode/
+*.pem
+*.key
+
+# Experiment data and generated results
+mlruns/
+outputs/
+reports/
+mlflow.db*
+*.db
+*.db-wal
+*.db-shm
