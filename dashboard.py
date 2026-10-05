@@ -62,7 +62,7 @@ with st.sidebar:
     outcomes = st.multiselect("Outcome", ["Success", "Failure", "Unknown"])
     hide_erroneous_errors = st.toggle(
         "Hide erroneous errors",
-        help="Exclude runs stopped by rate limits, provider capacity errors, invalid task or environment specifications, or failure to generate a valid environment.",
+        help="Exclude runs stopped by rate limits, provider capacity or judge API errors, invalid task or environment specifications, or failure to generate a valid environment.",
     )
     modes = st.multiselect("Run mode", ["Iterative", "One-shot"])
     lengths = st.multiselect("Specification length", ["Long", "Short"])
@@ -75,6 +75,7 @@ if hide_erroneous_errors:
     excluded = filtered.apply(effective_failure_category, axis=1).isin({
         "rate_limit", "provider_capacity", "invalid_task", "invalid_environment",
         "environment_generation_limit", "no_valid_environment", "route_search_limit",
+        "judge_provider_error",
     })
     filtered = filtered[~excluded]
 if query:
@@ -147,7 +148,7 @@ with overview:
                            "specification_length", "outcome", "iterations",
                            "overall_difficulty_score", "total_system_time_seconds",
                            "failure_reason", "generator_model", "judge_model",
-                           "reward_efficiency", "environment_minimum_steps_to_complete_trace",
+                           "reward_efficiency", "step_efficiency", "environment_minimum_steps_to_complete_trace",
                            "crm_parse_fail_percentage",
                            "run_id"]].rename(
                                columns={"task_number": "task_id"}

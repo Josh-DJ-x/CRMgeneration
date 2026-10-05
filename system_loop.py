@@ -13,6 +13,7 @@ from system_functions import (
     GridWorldLabellingFunction,
     Ollama,
     OpenRouter,
+    OpenAILLM,
     EnvironmentGenerationError,
     RouteSearchLimitError,
     calculate_trace_reward_bounds,
@@ -44,7 +45,7 @@ MAX_GENERATOR_CALLS = 6
 MAX_JUDGE_CALLS = 3
 TRAINING_EPISODES = 2500
 TRAINING_EVALUATION_INTERVAL = 100
-TRAINING_STEP_EFFICIENCY_THRESHOLD = 0.92
+TRAINING_STEP_EFFICIENCY_THRESHOLD = 0.8
 TRAINING_REWARD_EFFICIENCY_THRESHOLD = 0.99
 TRAINING_LEARNING_RATE = 0.1
 TRAINING_DISCOUNT_FACTOR = 0.99
@@ -130,7 +131,7 @@ def _llm_capacity_message(error):
 
 
 def main(gemini=None, openrouter=None, iterative=True, long=False, generator_backend="gemini",
-         judge_model=None, task_description=None):
+         judge_model=None, task_description=None, generator_model=None, judge_backend="openrouter"):
     """Run a task and record every unsuccessful exit with a diagnostic reason."""
     prompt = select_specifications(long)
     if task_description is None:
@@ -140,17 +141,22 @@ def main(gemini=None, openrouter=None, iterative=True, long=False, generator_bac
         "gemini": ("GEMINI_MODEL", "gemini-3.5-flash"),
         "ollama": ("OLLAMA_MODEL", "llama3.2"),
         "groq": ("GROQ_MODEL", "openai/gpt-oss-120b"),
+        "openai": ("OPENAI_MODEL", "gpt-4.1-mini"),
+        "openrouter": ("OPENROUTER_GENERATOR_MODEL", "qwen/qwen3-32b"),
     }.get(generator_backend, ("GEMINI_MODEL", generator_backend))
     context = {"stage": "initialization", "logged": False, "record": {
         "task_id": "unassigned", "task_description": task_description,
-        "generator_model": getattr(gemini, "model", os.getenv(model_setting, default_model)),
-        "judge_model": getattr(openrouter, "model", judge_model or os.getenv("OPENROUTER_MODEL", "openrouter/free")),
+        "generator_model": getattr(gemini, "model", generator_model or os.getenv(model_setting, default_model)),
+        "generator_backend": generator_backend, "judge_backend": judge_backend,
+        "judge_model": getattr(openrouter, "model", judge_model or (
+            os.getenv("OPENAI_JUDGE_MODEL", "gpt-4.1") if judge_backend == "openai"
+            else os.getenv("OPENROUTER_MODEL", "openrouter/free"))),
         "iterative": iterative, "long": long, "generator_call_count": 0,
         "judge_call_count": 0, "iterations": 0, "average_generation_time": 0.0,
     }}
     try:
         return _run_task(task_description, prompt, started, context, gemini, openrouter,
-                         iterative, long, generator_backend, judge_model)
+                         iterative, long, generator_backend, judge_model, generator_model, judge_backend)
     except (Exception, SystemExit, KeyboardInterrupt) as error:
         if not context["logged"]:
             if isinstance(error, KeyboardInterrupt):
@@ -171,7 +177,7 @@ def main(gemini=None, openrouter=None, iterative=True, long=False, generator_bac
 
 
 def _run_task(task_description, prompt, system_start, failure_context, gemini, openrouter,
-              iterative, long, generator_backend, judge_model):
+              iterative, long, generator_backend, judge_model, generator_model=None, judge_backend="openrouter"):
     """Generate a CRM, train it, and verify one agent trace against the fixed trace."""
     if not task_description.strip():
         failure_context["failure_category"] = "invalid_task"
@@ -179,20 +185,30 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     mlflow = configure_tracking()
     task_id = next_task_id(mlflow) if mlflow is not None else "1"
     failure_context["record"]["task_id"] = task_id
-    if generator_backend not in ("gemini", "ollama", "groq"):
-        raise ValueError("generator_backend must be 'gemini', 'ollama', or 'groq'")
+    if generator_backend not in ("gemini", "ollama", "groq", "openai", "openrouter"):
+        raise ValueError("Unknown generator backend")
+    if judge_backend not in ("openrouter", "openai"):
+        raise ValueError("judge_backend must be 'openrouter' or 'openai'")
     generator = gemini or (
-        Gemini(os.getenv("GEMINI_API_KEY"), model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash")) if generator_backend == "gemini" else
-        Ollama(model=os.getenv("OLLAMA_MODEL", "llama3.2")) if generator_backend == "ollama" else
-        Groq(os.getenv("GROQ_API_KEY"), model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"))
+        Gemini(os.getenv("GEMINI_API_KEY"), model=generator_model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")) if generator_backend == "gemini" else
+        Ollama(model=generator_model or os.getenv("OLLAMA_MODEL", "llama3.2")) if generator_backend == "ollama" else
+        Groq(os.getenv("GROQ_API_KEY"), model=generator_model or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")) if generator_backend == "groq" else
+        OpenAILLM(os.getenv("OPENAI_API_KEY"), model=generator_model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")) if generator_backend == "openai" else
+        OpenRouter(os.getenv("OPENROUTER_API_KEY"), model=generator_model or os.getenv("OPENROUTER_GENERATOR_MODEL", "qwen/qwen3-32b"))
     )
-    openrouter = openrouter or OpenRouter(
+    openrouter = openrouter or (OpenAILLM(
+        os.getenv("OPENAI_API_KEY"), model=judge_model or os.getenv("OPENAI_JUDGE_MODEL", "gpt-4.1"),
+    ) if judge_backend == "openai" else OpenRouter(
         os.getenv("OPENROUTER_API_KEY"),
         model=judge_model or os.getenv("OPENROUTER_MODEL", "openrouter/free"),
-    )
+    ))
+    requested_judge_model = getattr(openrouter, "model", type(openrouter).__name__)
+    judge_fallback_used = False
+    judge_chat_history = []
 
     generator_call_count = 0
     judge_call_count = 0
+    judge_evaluation_count = 0
     crm_validation_failures = 0
     generation_times = []
     generation_history = []
@@ -219,7 +235,8 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         record["time_seconds"] = duration
         iteration_times.append(duration)
 
-    def traced_call(name, span_type, attributes, inputs, callback, output_summary=None):
+    def traced_call(name, span_type, attributes, inputs, callback, output_summary=None,
+                    propagate_rate_limit=False):
         """Run a unit of work and record an MLflow span when tracking is enabled."""
         failure_context["stage"] = name
         stage_messages = {
@@ -241,13 +258,18 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                 return result
         except Exception as error:
             reason = _llm_capacity_message(error) if span_type == "LLM" else None
+            if propagate_rate_limit and reason == "rate limited":
+                raise
             if reason is None:
+                if name == "judge" and span_type == "LLM":
+                    failure_context["failure_category"] = "judge_provider_error"
+                    raise SystemExit(f"Judge LLM failed: {error}") from None
                 raise
             failure_context["failure_category"] = (
                 "rate_limit" if reason == "rate limited" else "provider_capacity"
             )
             raise SystemExit(
-                f"{name.capitalize()} LLM is {reason}. Please try again later."
+                f"{name.capitalize()} LLM is {reason}. Please try again later. Details: {error}"
             ) from None
 
     def call_generator(prompt):
@@ -271,18 +293,46 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         return response
 
     def call_judge(prompt):
-        nonlocal judge_call_count
-        if judge_call_count >= MAX_JUDGE_CALLS:
+        nonlocal judge_call_count, judge_evaluation_count, openrouter, judge_fallback_used
+        if judge_evaluation_count >= MAX_JUDGE_CALLS:
             raise SystemExit(
                 f"Judge call limit reached ({MAX_JUDGE_CALLS}) for this task."
             )
-        judge_call_count += 1
-        return traced_call(
-            "judge", "LLM",
-            {"model": getattr(openrouter, "model", type(openrouter).__name__)},
-            {"prompt": prompt},
-            lambda: timed(lambda: openrouter.generate(prompt), judge_times),
-        )
+        judge_evaluation_count += 1
+
+        def attempt(allow_fallback):
+            nonlocal judge_call_count
+            judge_call_count += 1
+            return traced_call(
+                "judge", "LLM",
+                {"model": getattr(openrouter, "model", type(openrouter).__name__)},
+                {"prompt": prompt},
+                lambda: timed(lambda: openrouter.generate(prompt), judge_times),
+                propagate_rate_limit=allow_fallback,
+            )
+
+        can_fallback = not judge_fallback_used and getattr(openrouter, "model", None) != "openrouter/free"
+        try:
+            judgement = attempt(can_fallback)
+        except Exception as error:
+            if not can_fallback or _llm_capacity_message(error) != "rate limited":
+                raise
+            print("Judge rate limited; switching to openrouter/free for the rest of this run.", flush=True)
+            try:
+                fallback = OpenRouter(os.getenv("OPENROUTER_API_KEY"), model="openrouter/free")
+            except Exception as setup_error:
+                failure_context["failure_category"] = "judge_provider_error"
+                raise SystemExit(f"Cannot initialize fallback judge: {setup_error}") from None
+            fallback.messages = list(judge_chat_history)
+            fallback.resolved_models = list(getattr(openrouter, "resolved_models", []))
+            openrouter = fallback
+            judge_fallback_used = True
+            judgement = attempt(False)
+        judge_chat_history.extend([
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": judgement},
+        ])
+        return judgement
 
     initial_prompt = (
         prompt["CRM_GENERATION_PROMPT"]
@@ -321,7 +371,10 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             "task_id": task_id,
             "task_description": task_description,
             "generator_model": getattr(generator, "model", type(generator).__name__),
-            "judge_model": getattr(openrouter, "model", type(openrouter).__name__),
+            "generator_backend": generator_backend,
+            "judge_backend": "openai+openrouter" if judge_fallback_used and judge_backend == "openai" else judge_backend,
+            "judge_model": requested_judge_model,
+            "judge_fallback_used": judge_fallback_used,
             "judge_models": list(getattr(openrouter, "resolved_models", [])),
             "iterative": iterative,
             "long": long,
@@ -734,7 +787,10 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         "success_status": status,
         "generation_history": generation_history,
         "generator_model": getattr(generator, "model", type(generator).__name__),
-        "judge_model": getattr(openrouter, "model", type(openrouter).__name__),
+        "generator_backend": generator_backend,
+        "judge_backend": "openai+openrouter" if judge_fallback_used and judge_backend == "openai" else judge_backend,
+        "judge_model": requested_judge_model,
+        "judge_fallback_used": judge_fallback_used,
         "judge_models": list(getattr(openrouter, "resolved_models", [])),
         "iterative": iterative,
         "long": long,

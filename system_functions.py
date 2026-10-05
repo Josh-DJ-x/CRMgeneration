@@ -32,6 +32,41 @@ class LLM(ABC):
         pass
 
 
+class OpenAILLM(LLM):
+    """Direct OpenAI Responses API provider for generation or judging."""
+
+    def __init__(self, api_key, model="gpt-4.1-mini"):
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is missing. Set it before running system.py.")
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        self.messages = []
+        self.resolved_models = []
+        self.last_response_model = None
+
+    def generate(self, prompt: str) -> str:
+        messages = self.messages + [{"role": "user", "content": prompt}]
+        response = self.client.responses.create(
+            model=self.model, input=messages, store=False,
+            include=["reasoning.encrypted_content"],
+        )
+        if getattr(response, "status", None) != "completed":
+            raise RuntimeError(
+                f"OpenAI ({self.model}) response was not completed: "
+                f"{getattr(response, 'error', None) or getattr(response, 'incomplete_details', None) or response.status}"
+            )
+        content = response.output_text
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"OpenAI ({self.model}) returned no answer text.")
+        self.messages = messages + list(response.output)
+        self.last_response_model = response.model
+        self.resolved_models.append(response.model)
+        return content
+
+    def reset_history(self):
+        self.messages = []
+
+
 class Gemini(LLM):
     def __init__(self, api_key, model="gemini-3.5-flash"):
         self.model = model
@@ -78,6 +113,14 @@ class Groq(LLM):
         return content
 
 
+class OpenRouterResponseError(RuntimeError):
+    """A provider error or unusable answer returned in an API response."""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class OpenRouter(LLM):
     def __init__(self, api_key, model="openrouter/free"):
         self.client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
@@ -87,14 +130,38 @@ class OpenRouter(LLM):
         self.last_response_model = None
 
     def generate(self, prompt: str) -> str:
-        self.messages.append({"role": "user", "content": prompt})
+        messages = self.messages + [{"role": "user", "content": prompt}]
         response = self.client.chat.completions.create(
-            model=self.model, messages=self.messages
+            model=self.model, messages=messages
         )
-        content = response.choices[0].message.content
+        error = getattr(response, "error", None)
+        if error:
+            code = error.get("code") if isinstance(error, dict) else getattr(error, "code", None)
+            detail = error.get("message") if isinstance(error, dict) else getattr(error, "message", None)
+            raise OpenRouterResponseError(
+                f"OpenRouter judge ({self.model}) returned an error"
+                f"{f' [{code}]' if code is not None else ''}: {detail or 'unspecified provider error'}",
+                status_code=code,
+            )
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise OpenRouterResponseError(
+                f"OpenRouter judge ({self.model}) returned no completion choices. "
+                "Provider overload or an invalid response is possible; no cause was supplied."
+            )
+        choice = choices[0]
+        content = getattr(getattr(choice, "message", None), "content", None)
+        if not isinstance(content, str) or not content.strip():
+            finish_reason = getattr(choice, "finish_reason", None)
+            raise OpenRouterResponseError(
+                f"OpenRouter judge ({self.model}) returned no answer text "
+                f"(finish_reason={finish_reason!r}). "
+                + ("The token budget may have been spent on reasoning; increase the output budget."
+                   if finish_reason == "length" else "Try again later or choose another free model.")
+            )
         self.last_response_model = getattr(response, "model", None)
         self.resolved_models.append(self.last_response_model or "unknown")
-        self.messages.append({"role": "assistant", "content": content})
+        self.messages = messages + [{"role": "assistant", "content": content}]
         return content
 
     def reset_history(self):
