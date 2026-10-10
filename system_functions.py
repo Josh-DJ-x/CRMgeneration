@@ -27,6 +27,14 @@ MAX_SEARCH_STATES = 5_000_000
 
 
 class LLM(ABC):
+    def reset_history(self):
+        """Start a new task conversation and discard prior response metadata."""
+        self.messages = []
+        if hasattr(self, "resolved_models"):
+            self.resolved_models = []
+        if hasattr(self, "last_response_model"):
+            self.last_response_model = None
+
     @abstractmethod
     def generate(self, prompt: str) -> str:
         pass
@@ -64,7 +72,7 @@ class OpenAILLM(LLM):
         return content
 
     def reset_history(self):
-        self.messages = []
+        super().reset_history()
 
 
 class Gemini(LLM):
@@ -75,6 +83,9 @@ class Gemini(LLM):
 
     def generate(self, prompt: str) -> str:
         return self.chat.send_message(prompt).text
+
+    def reset_history(self):
+        self.chat = self.client.chats.create(model=self.model)
 
 
 class Ollama(LLM):
@@ -116,9 +127,10 @@ class Groq(LLM):
 class OpenRouterResponseError(RuntimeError):
     """A provider error or unusable answer returned in an API response."""
 
-    def __init__(self, message, status_code=None):
+    def __init__(self, message, status_code=None, finish_reason=None):
         super().__init__(message)
         self.status_code = status_code
+        self.finish_reason = finish_reason
 
 
 class OpenRouter(LLM):
@@ -128,11 +140,12 @@ class OpenRouter(LLM):
         self.messages = []
         self.resolved_models = []
         self.last_response_model = None
+        self.max_tokens = 16384
 
     def generate(self, prompt: str) -> str:
         messages = self.messages + [{"role": "user", "content": prompt}]
         response = self.client.chat.completions.create(
-            model=self.model, messages=messages
+            model=self.model, messages=messages, max_tokens=self.max_tokens
         )
         error = getattr(response, "error", None)
         if error:
@@ -150,6 +163,14 @@ class OpenRouter(LLM):
                 "Provider overload or an invalid response is possible; no cause was supplied."
             )
         choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason == "length":
+            raise OpenRouterResponseError(
+                f"OpenRouter judge ({self.model}) reached the output token budget "
+                f"({self.max_tokens} tokens; finish_reason='length'). "
+                "Reasoning and answer text may share this budget; the answer is incomplete.",
+                finish_reason=finish_reason,
+            )
         content = getattr(getattr(choice, "message", None), "content", None)
         if not isinstance(content, str) or not content.strip():
             finish_reason = getattr(choice, "finish_reason", None)
@@ -165,7 +186,7 @@ class OpenRouter(LLM):
         return content
 
     def reset_history(self):
-        self.messages = []
+        super().reset_history()
 
 
 def _parse_trace(trace_text: str, section_name: str) -> tuple[str, ...]:
@@ -929,20 +950,23 @@ def validate_environment_spec(environment):
         "hazards"
     }
 
-    if set(environment.keys()) != required:
+    if not isinstance(environment, dict) or set(environment.keys()) != required:
         return False
 
-    if not isinstance(environment["coins"], int):
+    if type(environment["coins"]) is not int or environment["coins"] < 0:
         return False
 
-    if not isinstance(environment["bells"], int):
+    if type(environment["bells"]) is not int or environment["bells"] < 0:
         return False
 
     if not isinstance(environment["hazards"], bool):
         return False
 
+    if not isinstance(environment["keys"], dict):
+        return False
+
     if any(
-        not isinstance(v, int) or v < 0
+        type(v) is not int or v < 0
         for v in environment["keys"].values()
     ):
         return False
@@ -1177,7 +1201,15 @@ def _saturating_score(value, half_score):
     return value / (value + half_score)
 
 
-def environment_difficulty(grid, spec, desired_trace=None):
+MINIMUM_STEP_COLLECTIBLE_LIMIT = 17
+
+
+def collectible_count(spec):
+    """Count physical coin and key items, excluding bells and hazards."""
+    return spec["coins"] + sum(spec["keys"].values())
+
+
+def environment_difficulty(grid, spec, desired_trace=None, calculate_route=True):
 
     valid, metadata = validate_generated_grid(grid, spec)
 
@@ -1205,7 +1237,9 @@ def environment_difficulty(grid, spec, desired_trace=None):
         result["reachable_required_objects"] = 0
         result["validation_error"] = metadata
 
-    route = shortest_valid_trace_events(grid, desired_trace) if valid and desired_trace else None
+    route = (shortest_valid_trace_events(grid, desired_trace)
+             if calculate_route and collectible_count(spec) < MINIMUM_STEP_COLLECTIBLE_LIMIT
+             and valid and desired_trace else None)
     result["minimum_steps_to_complete_trace"] = len(route) if route is not None else None
 
     return result
@@ -1255,14 +1289,14 @@ def crm_specification(crm):
         },
     }
 
-def combined_difficulty(grid, environment_spec, crm=None, desired_trace=None):
+def combined_difficulty(grid, environment_spec, crm=None, desired_trace=None, calculate_route=True):
     """Task workload calibration; CRM complexity is diagnostic only.
 
     Three ordered keys with a 38-step route score 0.180. The 48-event
     reference task scores about 0.90, depending on layout and hazards.
     This is a calibrated task descriptor, not an empirical failure probability.
     """
-    env_metrics = environment_difficulty(grid, environment_spec, desired_trace)
+    env_metrics = environment_difficulty(grid, environment_spec, desired_trace, calculate_route=calculate_route)
     crm_metrics = crm_complexity(crm) if crm is not None else None
     events = [event.name if isinstance(event, Event) else event
               for event in (desired_trace or ())]
@@ -1430,7 +1464,7 @@ class RouteSearchLimitError(ValueError):
 
 
 def shortest_valid_trace_events(grid, desired_trace, max_search_states=None,
-                               time_limit_seconds=30.0):
+                               time_limit_seconds=60.0):
     """Find an exact shortest route; reuse it for difficulty and reward bounds."""
     if max_search_states is None:
         max_search_states = MAX_SEARCH_STATES
@@ -1685,10 +1719,11 @@ def run_agent(env, q_table, reward_bounds, capture_progression=False):
         "maximum_reward": reward_bounds["maximum_reward"],
         "reward_efficiency": reward_efficiency(
             total_reward, reward_bounds["minimum_reward"], reward_bounds["maximum_reward"]
-        ),
+        ) if reward_bounds["shortest_valid_steps"] is not None else None,
         "steps": steps,
         "minimum_steps": reward_bounds["shortest_valid_steps"],
-        "step_efficiency": step_efficiency(reward_bounds["shortest_valid_steps"], steps),
+        "step_efficiency": step_efficiency(reward_bounds["shortest_valid_steps"], steps)
+                           if reward_bounds["shortest_valid_steps"] is not None else None,
         "terminated": terminated,
         "truncated": truncated,
         "grid_progression": frames,

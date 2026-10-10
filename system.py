@@ -24,13 +24,13 @@ from system_loop import main
 # skips judge feedback and CRM refinement after an unsuccessful evaluation.
 ITERATIVE = True
 # Prompt-length A/B toggle. False selects every *_SHORT specification.
-long = False
+long = True
 # Select "gemini", "ollama", "groq", "openai", or "openrouter".
-GENERATOR_LLM = "gemini"
+GENERATOR_LLM = "groq"
 JUDGE_PROVIDER = "openrouter"
 
 # Pin the judge to a free reasoning model for consistent comparison runs.
-JUDGE_LLM = "nvidia/nemotron-3-ultra-550b-a55b:free"
+JUDGE_LLM = "poolside/laguna-s-2.1:free"
 
 # Judge Models
 # nvidia/nemotron-3-ultra-550b-a55b:free

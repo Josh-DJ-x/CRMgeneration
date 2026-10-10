@@ -13,10 +13,13 @@ from system_functions import (
     GridWorldLabellingFunction,
     Ollama,
     OpenRouter,
+    OpenRouterResponseError,
     OpenAILLM,
     EnvironmentGenerationError,
     RouteSearchLimitError,
     calculate_trace_reward_bounds,
+    collectible_count,
+    MINIMUM_STEP_COLLECTIBLE_LIMIT,
     combined_difficulty,
     crm_accepts_trace,
     crm_trace_alignment_error,
@@ -29,6 +32,7 @@ from system_functions import (
     format_trace,
     format_compact_trace,
     generate_gridworld,
+    parse_environment,
     run_agent,
     step_efficiency,
     traces_match,
@@ -202,6 +206,12 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         os.getenv("OPENROUTER_API_KEY"),
         model=judge_model or os.getenv("OPENROUTER_MODEL", "openrouter/free"),
     ))
+    # Injectable providers may be reused by callers across independent tasks.
+    # Reset once here, before any prompts; preserve history within the task.
+    for provider in (generator, openrouter):
+        reset_history = getattr(provider, "reset_history", None)
+        if callable(reset_history):
+            reset_history()
     requested_judge_model = getattr(openrouter, "model", type(openrouter).__name__)
     judge_fallback_used = False
     judge_chat_history = []
@@ -217,11 +227,13 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     grid_generation_times = []
     iteration_times = []
     iteration_history = []
+    latest_training_metrics = None
     ground_env = None
     environment_spec = None
     desired_trace = ()
     crm = None
     judge_reflection = ""
+    baseline_error = None
 
     def timed(callback, durations):
         start = time.perf_counter()
@@ -236,7 +248,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         iteration_times.append(duration)
 
     def traced_call(name, span_type, attributes, inputs, callback, output_summary=None,
-                    propagate_rate_limit=False):
+                    propagate_capacity_error=False):
         """Run a unit of work and record an MLflow span when tracking is enabled."""
         failure_context["stage"] = name
         stage_messages = {
@@ -258,11 +270,14 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                 return result
         except Exception as error:
             reason = _llm_capacity_message(error) if span_type == "LLM" else None
-            if propagate_rate_limit and reason == "rate limited":
+            if propagate_capacity_error and reason is not None:
                 raise
             if reason is None:
                 if name == "judge" and span_type == "LLM":
-                    failure_context["failure_category"] = "judge_provider_error"
+                    failure_context["failure_category"] = (
+                        "judge_output_budget" if isinstance(error, OpenRouterResponseError)
+                        and error.finish_reason == "length" else "judge_provider_error"
+                    )
                     raise SystemExit(f"Judge LLM failed: {error}") from None
                 raise
             failure_context["failure_category"] = (
@@ -275,8 +290,9 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     def call_generator(prompt):
         nonlocal generator_call_count
         if generator_call_count >= MAX_GENERATOR_CALLS:
-            raise SystemExit(
-                f"Generator call limit reached ({MAX_GENERATOR_CALLS}) for this task."
+            stop_generation(
+                f"Generator call limit reached ({MAX_GENERATOR_CALLS}) for this task.",
+                completed_iterations=len(iteration_history),
             )
         generator_call_count += 1
         response = traced_call(
@@ -305,19 +321,21 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             judge_call_count += 1
             return traced_call(
                 "judge", "LLM",
-                {"model": getattr(openrouter, "model", type(openrouter).__name__)},
+                {"model": getattr(openrouter, "model", type(openrouter).__name__),
+                 "max_tokens": getattr(openrouter, "max_tokens", None)},
                 {"prompt": prompt},
                 lambda: timed(lambda: openrouter.generate(prompt), judge_times),
-                propagate_rate_limit=allow_fallback,
+                propagate_capacity_error=allow_fallback,
             )
 
         can_fallback = not judge_fallback_used and getattr(openrouter, "model", None) != "openrouter/free"
         try:
             judgement = attempt(can_fallback)
         except Exception as error:
-            if not can_fallback or _llm_capacity_message(error) != "rate limited":
+            reason = _llm_capacity_message(error)
+            if not can_fallback or reason is None:
                 raise
-            print("Judge rate limited; switching to openrouter/free for the rest of this run.", flush=True)
+            print(f"Judge is {reason}; switching to openrouter/free for the rest of this run.", flush=True)
             try:
                 fallback = OpenRouter(os.getenv("OPENROUTER_API_KEY"), model="openrouter/free")
             except Exception as setup_error:
@@ -366,6 +384,44 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             return response, None, str(error), False
         return crm_text, *validate_crm(crm_text)
 
+    def validate_generation(response):
+        nonlocal desired_trace, environment_spec, crm_validation_failures
+        nonlocal baseline_error
+        if environment_spec is not None:
+            return validate_refinement(response)
+        try:
+            trace, crm_text, environment_text = extract_generation_trace(response, initial=True)
+            specification = parse_environment(environment_text)
+        except ValueError as error:
+            crm_validation_failures += 1
+            return response, None, str(error), False
+        desired_trace, environment_spec = trace, specification
+        items = collectible_count(specification)
+        if items >= MINIMUM_STEP_COLLECTIBLE_LIMIT:
+            baseline_error = (
+                f"Skipped minimum-step calculation: {items} collectible items "
+                f"meet the {MINIMUM_STEP_COLLECTIBLE_LIMIT}-item threshold."
+            )
+            print(baseline_error + " Training will use the full episode budget and trace-only qualification.", flush=True)
+        elif baseline_error and baseline_error.startswith("Skipped minimum-step calculation:"):
+            baseline_error = None
+        return crm_text, *validate_crm(crm_text)
+
+    def initial_repair_prompt(issue):
+        return (
+            initial_prompt + "\n\nRepair the previous response for this same task. "
+            "Return all three sections: <<<DESIRED_TRACE>>>, <<<ENVIRONMENT>>>, <<<CRM>>>. "
+            "The trace must contain only supported EVENT or EVENT x positive_count stages "
+            "joined by ->, ending with GOAL. State numbers and terminal annotations belong "
+            "in the CRM, never in DESIRED_TRACE. Preserve the user's task intent.\n"
+            "ENVIRONMENT must have exactly coins, keys, bells and hazards. Coins, bells "
+            "and each red/blue/green/yellow key count must be nonnegative integers; "
+            "hazards must be boolean. At most 84 object cells fit, including 7 hazard "
+            "cells when enabled. Bells counts physical bell tiles, not the number of "
+            "rings: one bell can be rung repeatedly.\n"
+            "Validation failure:\n" + str(issue) + "\n\nPrevious response:\n" + generation
+        )
+
     def failure_record(message, completed_iterations=0):
         record = {
             "task_id": task_id,
@@ -405,7 +461,8 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                         task_trace=desired_trace,
                     )
                 difficulty = combined_difficulty(
-                    difficulty_env.grid.tolist(), environment_spec, crm, desired_trace
+                    difficulty_env.grid.tolist(), environment_spec, crm, desired_trace,
+                    **({"calculate_route": False} if baseline_error else {})
                 )
                 record.update(
                     overall_difficulty_score=difficulty["difficulty_score"],
@@ -423,6 +480,8 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             final_trace=list(iteration_history[-1]["agent_trace"]) if iteration_history else [],
             judge_reflection=judge_reflection,
         )
+        if latest_training_metrics is not None:
+            record.update(latest_training_metrics)
         return record
     failure_context["snapshot"] = lambda: failure_record("", len(iteration_history))
 
@@ -453,12 +512,21 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             judge_prompt = _judge_followup_prompt(
                 iteration_record["iteration"], generation, raw_run_information, agent_trace,
             )
+        if baseline_error:
+            judge_prompt += (
+                "\n\nShortest-route baseline is unavailable. Efficiency values are null, "
+                "not zero; qualification for this run requires only an exact desired-trace "
+                "match. Diagnose trace failures without requiring efficiency thresholds."
+            )
         if iteration_record.get("validation_error"):
             judge_prompt += (
-                "\n\nTraining and evaluation were skipped because CRM validation failed "
+                "\n\nTask:\n" + task_description
+                + "\n\nTraining and evaluation were skipped because generation validation failed "
                 "after three correction attempts. Diagnose the supplied validation_error "
-                "and suggest precise CRM repairs. No agent run or efficiency measurements "
-                "are available for this iteration.\nEnvironment specification (fixed):\n"
+                "and suggest precise repairs to the trace, environment or CRM as needed. "
+                "No agent run or efficiency measurements are available for this iteration. "
+                "An empty desired trace means initial parsing failed; it is not a valid target. "
+                "Once validated and buildable, the desired trace and environment are fixed.\nEnvironment specification:\n"
                 + json.dumps(environment_spec, indent=2)
             )
         judgement = call_judge(judge_prompt)
@@ -466,6 +534,57 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         iteration_record["judge_model"] = getattr(openrouter, "last_response_model", None)
         return judgement
 
+    def prepare_generation(build_for_diagnostics=False):
+        nonlocal ground_env, environment_spec, desired_trace, crm, parse_error, accepts_trace
+        nonlocal env, reward_bounds, crm_validation_failures
+        nonlocal baseline_error
+        if environment_spec is None or (not accepts_trace and not build_for_diagnostics):
+            return
+        stage = "environment_generation"
+        failure_context["stage"] = stage
+        try:
+            if ground_env is None:
+                started = time.perf_counter()
+                try:
+                    ground_env = traced_call(
+                        stage, "TOOL", {}, {"environment_spec": environment_spec},
+                        lambda: generate_gridworld(seed=42, environment_json=json.dumps(environment_spec),
+                                                   task_trace=desired_trace),
+                        lambda result: environment_difficulty(result.grid.tolist(), environment_spec, desired_trace,
+                                                              calculate_route=False),
+                    )
+                finally:
+                    grid_generation_times.append(time.perf_counter() - started)
+            if not accepts_trace:
+                return
+            stage = "evaluation reward bounds"
+            failure_context["stage"] = stage
+            env = GridWorldCrossProduct(ground_env=ground_env, crm=crm,
+                                       lf=GridWorldLabellingFunction(ground_env), max_steps=200)
+            if baseline_error:
+                reward_bounds = {"shortest_valid_steps": None, "minimum_reward": None, "maximum_reward": None}
+            else:
+                reward_bounds = calculate_trace_reward_bounds(crm, desired_trace, env.max_steps, ground_env.grid)
+        except RouteSearchLimitError as error:
+            if stage == "environment_generation" or env is None:
+                failure_context["failure_category"] = "route_search_limit"
+                raise SystemExit(f"Task stopped during shortest-route calculation: {error}") from None
+            baseline_error = str(error)
+            reward_bounds = {"shortest_valid_steps": None, "minimum_reward": None, "maximum_reward": None}
+            print("Shortest-route baseline unavailable; training for the full episode budget "
+                  "and qualifying by trace match only. Efficiency metrics will be blank.", flush=True)
+        except (EnvironmentGenerationError, ValueError, LookupError, TypeError, NameError, ArithmeticError) as error:
+            # These diagnostics describe unusable generated content, not an agent
+            # evaluation. Feed them back through the same bounded repair loop.
+            if accepts_trace:
+                crm_validation_failures += 1
+            parse_error = f"{stage}: {type(error).__name__}: {error}"
+            crm, accepts_trace = None, False
+            if stage == "environment_generation" or str(error) == "No ordered route exists for the desired trace.":
+                environment_spec, ground_env, desired_trace = None, None, ()
+            failure_context["stage"] = "generation validation"
+
+    env = reward_bounds = None
     first_iteration_start = time.perf_counter()
     print("\nIteration 1", flush=True)
     generation = call_generator(initial_prompt)
@@ -474,16 +593,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     if is_invalid_task_response(generation):
         failure_context["failure_category"] = "invalid_task"
         stop_generation("Please specify a valid task")
-    try:
-        desired_trace, crm_text, environment_text = extract_generation_trace(
-            generation, initial=True
-        )
-    except ValueError as error:
-        if "<<<CRM>>>" not in generation.upper():
-            crm_validation_failures += 1
-        stop_generation(f"Initial generation was invalid: {error}")
-    environment_spec = json.loads(environment_text)
-    crm, parse_error, accepts_trace = validate_crm(crm_text)
+    crm_text, crm, parse_error, accepts_trace = validate_generation(generation)
 
     performance = False
     trace_correct = False
@@ -497,15 +607,21 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         completed_iterations += 1
         if iterations > 1:
             print(f"\nIteration {iterations}", flush=True)
-            generation = call_generator(
+            refinement_prompt = (
                 prompt["REFINEMENT_CONTEXT"] + "\n\nDesired trace:\n"
                 + format_compact_trace(desired_trace) + "\n\nEnvironment specification (fixed):\n"
                 + json.dumps(environment_spec, indent=2) + "\n\nJudge response:\n\n" + judgement + "\n\n"
                 + "Raw run information:\n" + raw_run_information
             )
+            if environment_spec is None:
+                refinement_prompt = initial_repair_prompt(parse_error) + "\n\nJudge response:\n" + judgement
+            generation = call_generator(refinement_prompt)
             print("Validating generation...", flush=True)
             failure_context["stage"] = "CRM refinement validation"
-            crm_text, crm, parse_error, accepts_trace = validate_refinement(generation)
+            crm_text, crm, parse_error, accepts_trace = validate_generation(generation)
+        if iterations > 1 and accepts_trace:
+            ground_env = None
+        prepare_generation()
         parse_fails = 0
         while not accepts_trace and parse_fails < 3:
             parse_fails += 1
@@ -513,52 +629,30 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                 issue = parse_error or prompt["FAIL_PARSE"]
             else:
                 issue = crm_trace_alignment_error(crm, desired_trace)
-            print(f"Correcting CRM (attempt {parse_fails}/3): {issue}", flush=True)
+            print(f"Correcting generation (attempt {parse_fails}/3): {issue}", flush=True)
             correction_prompt = (
                 "Validation failure:\n" + str(issue)
                 + "\n\nDESIRED_TRACE:\n" + format_compact_trace(desired_trace)
+                + "\n\nPrevious CRM:\n" + crm_text
                 + "\n\n" + prompt["COMMON_PITFALLS"]
             )
+            if environment_spec is None:
+                correction_prompt = initial_repair_prompt(issue)
             generation = call_generator(correction_prompt)
             failure_context["stage"] = "CRM correction validation"
-            crm_text, crm, parse_error, accepts_trace = validate_refinement(generation)
+            crm_text, crm, parse_error, accepts_trace = validate_generation(generation)
+            prepare_generation()
+        if not accepts_trace and iterative:
+            prepare_generation(build_for_diagnostics=True)
         if not accepts_trace and not iterative:
             issue = parse_error if crm is None else crm_trace_alignment_error(crm, desired_trace)
             stop_generation(
-                "CRM could not be aligned with DESIRED_TRACE after three corrections. " + str(issue),
+                ("Initial generation could not be parsed" if environment_spec is None
+                 else "CRM could not be aligned with DESIRED_TRACE")
+                + " after three corrections. " + str(issue),
                 completed_iterations=len(iteration_history),
             )
 
-        grid_generation_start = time.perf_counter()
-        try:
-            ground_env = traced_call(
-                "environment_generation", "TOOL", {},
-                {"environment_spec": environment_spec},
-                lambda: generate_gridworld(
-                    seed=42,
-                    environment_json=json.dumps(environment_spec),
-                    task_trace=desired_trace,
-                ),
-                lambda result: environment_difficulty(
-                    result.grid.tolist(), environment_spec, desired_trace
-                ),
-            )
-        except RouteSearchLimitError as error:
-            failure_context["failure_category"] = "route_search_limit"
-            raise SystemExit(f"Task stopped during shortest-route calculation: {error}") from None
-        except EnvironmentGenerationError as error:
-            failure_context["failure_category"] = "environment_generation_limit"
-            raise SystemExit(
-                f"Environment generation stopped: {error} "
-                "Task stopped before training. Please try generating the task again."
-            ) from None
-        except ValueError as error:
-            failure_context["failure_category"] = "invalid_environment"
-            raise SystemExit(
-                f"Environment generation failed: {error} "
-                "Task stopped before training. Please try generating the task again."
-            ) from None
-        grid_generation_times.append(time.perf_counter() - grid_generation_start)
         if not accepts_trace:
             issue = parse_error if crm is None else crm_trace_alignment_error(crm, desired_trace)
             raw_run_information = json.dumps({
@@ -569,7 +663,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             iteration_record = {
                 "iteration": iterations,
                 "environment_spec": environment_spec,
-                "grid": ground_env.grid.tolist(),
+                "grid": ground_env.grid.tolist() if ground_env is not None else [],
                 "crm_specification": crm_specification(crm) if crm is not None else None,
                 "crm_text": crm_text,
                 "desired_trace": list(desired_trace),
@@ -586,50 +680,35 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             if iterations >= 3:
                 finish_iteration(iteration_record, iteration_start)
                 stop_generation(
-                    "CRM could not be aligned with DESIRED_TRACE after three corrections. " + str(issue),
+                    ("Initial generation could not be parsed" if environment_spec is None
+                     else "CRM could not be aligned with DESIRED_TRACE")
+                    + " after three corrections. " + str(issue),
                     completed_iterations=len(iteration_history),
                 )
-            print("CRM validation failed after three corrections; passing to judge.", flush=True)
+            print("Generation validation failed after three corrections; passing to judge.", flush=True)
             judgement = judge_iteration(iteration_record, generation, raw_run_information, ())
             judge_reflection = iteration_record["judge_feedback"]
             finish_iteration(iteration_record, iteration_start)
             iterations += 1
             continue
-        labelling_function = GridWorldLabellingFunction(ground_env)
-        env = GridWorldCrossProduct(
-            ground_env=ground_env,
-            crm=crm,
-            lf=labelling_function,
-            max_steps=200,
-        )
-        failure_context["stage"] = "evaluation reward bounds"
-        try:
-            reward_bounds = calculate_trace_reward_bounds(
-                crm, desired_trace, env.max_steps, ground_env.grid
-            )
-        except RouteSearchLimitError as error:
-            failure_context["failure_category"] = "route_search_limit"
-            raise SystemExit(f"Task stopped during shortest-route calculation: {error}") from None
-        except ValueError as error:
-            if str(error) != "No ordered route exists for the desired trace.":
-                raise
-            failure_context["failure_category"] = "no_valid_environment"
-            raise SystemExit(
-                "The generated grid has no route matching the desired trace. "
-                "Please try generating the task again."
-            ) from None
         training_evaluations = []
         checkpoint_run = None
 
         def record_step_metrics(info):
             info["minimum_steps"] = reward_bounds["shortest_valid_steps"]
-            info["step_efficiency"] = step_efficiency(info["minimum_steps"], info["steps"])
+            info["step_efficiency"] = step_efficiency(info["minimum_steps"], info["steps"]) if not baseline_error else None
+            if baseline_error:
+                info.update(reward_efficiency=None, minimum_reward=None, maximum_reward=None)
             return info
 
         def stop_training(q_table, completed_episodes):
-            nonlocal checkpoint_run
+            nonlocal checkpoint_run, latest_training_metrics
             checkpoint_run = run_agent(env, q_table, reward_bounds, capture_progression=True)
             record_step_metrics(checkpoint_run)
+            latest_training_metrics = {
+                "step_efficiency": checkpoint_run.get("step_efficiency"),
+                "reward_efficiency": checkpoint_run.get("reward_efficiency"),
+            }
             trace_correct = traces_match(desired_trace, checkpoint_run["trace"])
             efficiency = checkpoint_run["step_efficiency"]
             satisfied = _performance_passed(checkpoint_run) and trace_correct
@@ -677,7 +756,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                 seed=TRAINING_SEED,
                 reward_shaping=TRAINING_REWARD_SHAPING,
                 evaluation_interval=TRAINING_EVALUATION_INTERVAL,
-                stop_training=stop_training,
+                stop_training=stop_training if not baseline_error else None,
             ),
             lambda result: {
                 "episodes": len(result[1]),
@@ -702,7 +781,11 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                 "steps": result["steps"],
             },
         )
-        performance = _performance_passed(run_information)
+        latest_training_metrics = {
+            "step_efficiency": run_information.get("step_efficiency"),
+            "reward_efficiency": run_information.get("reward_efficiency"),
+        }
+        performance = _performance_passed(run_information) if not baseline_error else traces_match(desired_trace, run_information["trace"])
         agent_trace = run_information["trace"]
         raw_run_information = _serialise_run_information(run_information)
 
@@ -710,8 +793,8 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         # transcription of it.  The judge remains part of the failure loop,
         # where it provides natural-language feedback for CRM refinement.
         trace_correct = traces_match(desired_trace, agent_trace)
-        print(f"Evaluation: step efficiency={run_information['step_efficiency']:.4f}, "
-              f"reward efficiency={run_information['reward_efficiency']:.4f}, "
+        print(f"Evaluation: step efficiency={run_information['step_efficiency']}, "
+              f"reward efficiency={run_information['reward_efficiency']}, "
               f"steps={run_information['steps']}/{run_information['minimum_steps']} minimum, "
               f"trace match={trace_correct}, performance passed={performance}", flush=True)
         iteration_record = {
@@ -749,7 +832,8 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     failure_context["stage"] = "postprocessing"
     print("Preparing results...", flush=True)
     difficulty = combined_difficulty(
-        ground_env.grid.tolist(), environment_spec, crm, desired_trace
+        ground_env.grid.tolist(), environment_spec, crm, desired_trace,
+        **({"calculate_route": False} if baseline_error else {})
     )
     specifications = {
         "difficulty": difficulty,
@@ -798,7 +882,9 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         "training_evaluation_interval": TRAINING_EVALUATION_INTERVAL,
         "training_step_efficiency_threshold": TRAINING_STEP_EFFICIENCY_THRESHOLD,
         "training_reward_efficiency_threshold": TRAINING_REWARD_EFFICIENCY_THRESHOLD,
-        "performance_criterion": "step_and_reward_efficiency",
+        "performance_criterion": "trace_only" if baseline_error else "step_and_reward_efficiency",
+        "efficiency_baseline_available": not bool(baseline_error),
+        "efficiency_baseline_error": baseline_error or "",
         "training_learning_rate": TRAINING_LEARNING_RATE,
         "training_discount_factor": TRAINING_DISCOUNT_FACTOR,
         "training_initial_epsilon": TRAINING_INITIAL_EPSILON,
