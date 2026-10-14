@@ -122,6 +122,50 @@ Training currently allows 2,500 episodes of up to 200 steps, evaluating every 10
 the run uses its full episode budget and qualifies by trace match alone; missing
 efficiency metrics remain blank. Details are in [results](docs/results.md).
 
+## Interactive playground (`system_fancy.py`)
+
+After completing the local setup, launch the one-page playground from the repository root:
+
+```bash
+python system_fancy.py
+```
+
+The interface opens at **http://localhost:8502**. In PowerShell, you can also launch
+it without activating the existing virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe system_fancy.py
+```
+
+Set `GEMINI_API_KEY` and the configured judge's key in the same terminal before
+launching. The playground uses **Gemini 3.5 Flash Lite**, **iterative refinement**,
+and **long specifications**. The judge follows `JUDGE_PROVIDER` / `JUDGE_LLM` in
+`system.py`; the default OpenRouter judge requires `OPENROUTER_API_KEY`.
+
+1. Read the object guide and valid-task examples on the right.
+2. Choose an example to edit, or enter a task such as
+   "Collect 3 coins, then a blue key, then ring the bell twice."
+3. Select **Run task**. The generated grid appears during training, followed by
+   an animated replay and the task result.
+4. Expand **Environment specification and generated CRM** to inspect the generated
+   definitions. Scroll down to see previous tasks.
+
+One web experiment runs at a time. History persists in `outputs/fancy/`, with
+experiment records also saved in MLflow. Existing terminal runs are available
+through the results dashboard rather than the playground's history.
+
+Optional launch settings:
+
+```bash
+python system_fancy.py --port 8503
+python system_fancy.py --no-browser
+```
+
+The server listens locally at `127.0.0.1`. Keep the terminal open while using the
+page, and press **Ctrl+C** to stop it. An experiment worker already in progress
+may finish independently. No additional dependencies beyond `requirements.txt`
+are needed.
+
 ## View and export results
 
 ```bash
@@ -143,6 +187,7 @@ directories may require updating MLflow's stored paths.
 
 ```text
 system.py                  Command-line entry point
+system_fancy.py            Launch the local GridWorld Studio website
 system_loop.py             Generation, training, evaluation, and refinement loop
 system_functions.py        LLM adapters, grid generation, CRM parsing, and Q-learning
 system_specifications.py   Long and short prompts
@@ -153,6 +198,7 @@ grid_visualizer.py         Grid animation rendering
 crm_support/               Tracking, failure diagnostics, and result analysis
 scripts/                   Report export utility
 templates/                 Quarto report template
+web/                       Studio page and styling
 docs/                      Usage details and historical research notes
 tests/                     Offline regression tests and CRM fixtures
 requirements.txt           Direct Python dependencies
@@ -167,6 +213,7 @@ run artifacts are not included.
 
 ```bash
 python system.py --help
+python system_fancy.py --help
 python -m scripts.export_report --help
 python -m unittest discover -s tests
 ```

@@ -144,7 +144,7 @@ def main(gemini=None, openrouter=None, iterative=True, long=False, generator_bac
         task_description = input(prompt["TASK_PROMPT"])
     started = time.perf_counter()
     model_setting, default_model = {
-        "gemini": ("GEMINI_MODEL", "gemini-3.5-flash"),
+        "gemini": ("GEMINI_MODEL", "gemini-3.5-flash-lite"),
         "ollama": ("OLLAMA_MODEL", "llama3.2"),
         "groq": ("GROQ_MODEL", "openai/gpt-oss-120b"),
         "nvidia": ("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
@@ -199,7 +199,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     if judge_backend not in ("openrouter", "openai"):
         raise ValueError("judge_backend must be 'openrouter' or 'openai'")
     generator = gemini or (
-        Gemini(os.getenv("GEMINI_API_KEY"), model=generator_model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")) if generator_backend == "gemini" else
+        Gemini(os.getenv("GEMINI_API_KEY"), model=generator_model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")) if generator_backend == "gemini" else
         Ollama(model=generator_model or os.getenv("OLLAMA_MODEL", "llama3.2")) if generator_backend == "ollama" else
         Groq(os.getenv("GROQ_API_KEY"), model=generator_model or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")) if generator_backend == "groq" else
         Nvidia(os.getenv("NVIDIA_API_KEY"), model=generator_model or os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"), reasoning_effort=nvidia_reasoning, max_tokens=nvidia_max_tokens) if generator_backend == "nvidia" else
@@ -590,6 +590,11 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                         lambda result: environment_difficulty(result.grid.tolist(), environment_spec, desired_trace,
                                                               calculate_route=False),
                     )
+                    if os.getenv("GRIDWORLD_PREVIEW_PATH"):
+                        preview_path = os.environ["GRIDWORLD_PREVIEW_PATH"]
+                        with open(preview_path + ".tmp", "w", encoding="utf-8") as preview:
+                            json.dump(ground_env.grid.tolist(), preview)
+                        os.replace(preview_path + ".tmp", preview_path)
                 finally:
                     grid_generation_times.append(time.perf_counter() - started)
             if not accepts_trace:
@@ -879,7 +884,9 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     }
     try:
         animation_path, is_gif = export_grid_animation(
-            run_information["grid_progression"], bell_rings=run_information["bell_rings"]
+            run_information["grid_progression"], bell_rings=run_information["bell_rings"],
+            **({"output_path": os.environ["GRIDWORLD_ANIMATION_PATH"]}
+               if os.getenv("GRIDWORLD_ANIMATION_PATH") else {}),
         )
         animation_message = (
             f"Animation: {animation_path}" if is_gif
@@ -983,6 +990,8 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     print(f"Final Trace: {format_trace(run_information['trace'])}")
     print(animation_message)
     print(mlflow_message)
+    return {**mlflow_record,
+            "animation_path": str(animation_path) if animation_path is not None else None}
 
 
 if __name__ == "__main__":

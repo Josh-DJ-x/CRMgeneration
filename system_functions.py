@@ -76,7 +76,7 @@ class OpenAILLM(LLM):
 
 
 class Gemini(LLM):
-    def __init__(self, api_key, model="gemini-3.5-flash"):
+    def __init__(self, api_key, model="gemini-3.5-flash-lite"):
         self.model = model
         self.client = genai.Client(api_key=api_key)
         self.chat = self.client.chats.create(model=self.model)

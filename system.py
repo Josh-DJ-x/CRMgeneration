@@ -78,7 +78,8 @@ def cli(argv=None):
         options["task_description"] = args.task
     if args.mode is None:
         try:
-            return main(iterative=ITERATIVE, long=long, **options)
+            main(iterative=ITERATIVE, long=long, **options)
+            return 0
         except (Exception, SystemExit) as error:
             # main logs the failed run before propagating its diagnostic.
             print(f"Run stopped: {error}", flush=True)
