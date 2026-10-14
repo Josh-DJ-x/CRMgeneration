@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from semantic_specifications import GENERATION_FORMAT_SHORT
+from system_specifications import GENERATION_FORMAT_SHORT
 import system_loop
 from system_functions import (
     Event, crm_accepts_trace, crm_parse, crm_trace_alignment_error, extract_generation_trace,

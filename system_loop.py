@@ -4,11 +4,12 @@ import json
 import os
 import time
 
-from semantic_specifications import select_specifications
-from failure_diagnostics import failure_reason
+from system_specifications import select_specifications
+from crm_support.failure_diagnostics import failure_reason
 from system_functions import (
     Gemini,
     Groq,
+    Nvidia,
     GridWorldCrossProduct,
     GridWorldLabellingFunction,
     Ollama,
@@ -18,7 +19,7 @@ from system_functions import (
     EnvironmentGenerationError,
     RouteSearchLimitError,
     calculate_trace_reward_bounds,
-    collectible_count,
+    minimum_step_collectible_limit_reached,
     MINIMUM_STEP_COLLECTIBLE_LIMIT,
     combined_difficulty,
     crm_accepts_trace,
@@ -39,7 +40,7 @@ from system_functions import (
     train_agent,
 )
 from grid_visualizer import export_grid_animation
-from mlflow_tracking import (
+from crm_support.mlflow_tracking import (
     configure_tracking, log_experiment_run, log_generation_failure, next_task_id,
 )
 
@@ -135,7 +136,8 @@ def _llm_capacity_message(error):
 
 
 def main(gemini=None, openrouter=None, iterative=True, long=False, generator_backend="gemini",
-         judge_model=None, task_description=None, generator_model=None, judge_backend="openrouter"):
+         judge_model=None, task_description=None, generator_model=None, judge_backend="openrouter",
+         nvidia_reasoning="high", nvidia_max_tokens=16384):
     """Run a task and record every unsuccessful exit with a diagnostic reason."""
     prompt = select_specifications(long)
     if task_description is None:
@@ -145,6 +147,7 @@ def main(gemini=None, openrouter=None, iterative=True, long=False, generator_bac
         "gemini": ("GEMINI_MODEL", "gemini-3.5-flash"),
         "ollama": ("OLLAMA_MODEL", "llama3.2"),
         "groq": ("GROQ_MODEL", "openai/gpt-oss-120b"),
+        "nvidia": ("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"),
         "openai": ("OPENAI_MODEL", "gpt-4.1-mini"),
         "openrouter": ("OPENROUTER_GENERATOR_MODEL", "qwen/qwen3-32b"),
     }.get(generator_backend, ("GEMINI_MODEL", generator_backend))
@@ -160,7 +163,8 @@ def main(gemini=None, openrouter=None, iterative=True, long=False, generator_bac
     }}
     try:
         return _run_task(task_description, prompt, started, context, gemini, openrouter,
-                         iterative, long, generator_backend, judge_model, generator_model, judge_backend)
+                         iterative, long, generator_backend, judge_model, generator_model, judge_backend,
+                         nvidia_reasoning, nvidia_max_tokens)
     except (Exception, SystemExit, KeyboardInterrupt) as error:
         if not context["logged"]:
             if isinstance(error, KeyboardInterrupt):
@@ -181,7 +185,8 @@ def main(gemini=None, openrouter=None, iterative=True, long=False, generator_bac
 
 
 def _run_task(task_description, prompt, system_start, failure_context, gemini, openrouter,
-              iterative, long, generator_backend, judge_model, generator_model=None, judge_backend="openrouter"):
+              iterative, long, generator_backend, judge_model, generator_model=None, judge_backend="openrouter",
+              nvidia_reasoning="high", nvidia_max_tokens=16384):
     """Generate a CRM, train it, and verify one agent trace against the fixed trace."""
     if not task_description.strip():
         failure_context["failure_category"] = "invalid_task"
@@ -189,7 +194,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
     mlflow = configure_tracking()
     task_id = next_task_id(mlflow) if mlflow is not None else "1"
     failure_context["record"]["task_id"] = task_id
-    if generator_backend not in ("gemini", "ollama", "groq", "openai", "openrouter"):
+    if generator_backend not in ("gemini", "ollama", "groq", "openai", "openrouter", "nvidia"):
         raise ValueError("Unknown generator backend")
     if judge_backend not in ("openrouter", "openai"):
         raise ValueError("judge_backend must be 'openrouter' or 'openai'")
@@ -197,6 +202,7 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         Gemini(os.getenv("GEMINI_API_KEY"), model=generator_model or os.getenv("GEMINI_MODEL", "gemini-3.5-flash")) if generator_backend == "gemini" else
         Ollama(model=generator_model or os.getenv("OLLAMA_MODEL", "llama3.2")) if generator_backend == "ollama" else
         Groq(os.getenv("GROQ_API_KEY"), model=generator_model or os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")) if generator_backend == "groq" else
+        Nvidia(os.getenv("NVIDIA_API_KEY"), model=generator_model or os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-super-120b-a12b"), reasoning_effort=nvidia_reasoning, max_tokens=nvidia_max_tokens) if generator_backend == "nvidia" else
         OpenAILLM(os.getenv("OPENAI_API_KEY"), model=generator_model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")) if generator_backend == "openai" else
         OpenRouter(os.getenv("OPENROUTER_API_KEY"), model=generator_model or os.getenv("OPENROUTER_GENERATOR_MODEL", "qwen/qwen3-32b"))
     )
@@ -206,6 +212,20 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
         os.getenv("OPENROUTER_API_KEY"),
         model=judge_model or os.getenv("OPENROUTER_MODEL", "openrouter/free"),
     ))
+    # A random free judge can resolve to the generator itself. Use pinned
+    # alternatives for this generator, including when a judge needs fallback.
+    exclude_nemotron_judge = (
+        str(getattr(generator, "model", "")).split(":", 1)[0]
+        == "nvidia/nemotron-3-super-120b-a12b"
+    )
+    if exclude_nemotron_judge:
+        selected_judge = str(getattr(openrouter, "model", ""))
+        if selected_judge.split(":", 1)[0] == "nvidia/nemotron-3-super-120b-a12b":
+            raise ValueError("Nemotron 3 Super cannot judge when it is the generator. Choose another judge model.")
+        if selected_judge == "openrouter/free":
+            openrouter = OpenRouter(
+                os.getenv("OPENROUTER_API_KEY"), model="poolside/laguna-s-2.1:free",
+            )
     # Injectable providers may be reused by callers across independent tasks.
     # Reset once here, before any prompts; preserve history within the task.
     for provider in (generator, openrouter):
@@ -214,6 +234,20 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             reset_history()
     requested_judge_model = getattr(openrouter, "model", type(openrouter).__name__)
     judge_fallback_used = False
+    if exclude_nemotron_judge or requested_judge_model == "poolside/laguna-s-2.1:free":
+        judge_fallback_models = [
+            "poolside/laguna-s-2.1:free",
+            "google/gemma-4-31b-it:free",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "qwen/qwen3.8-27b:free",
+        ]
+        generator_id = str(getattr(generator, "model", "")).split(":", 1)[0]
+        judge_fallback_models = [
+            model for model in judge_fallback_models
+            if model != requested_judge_model and model.split(":", 1)[0] != generator_id
+        ]
+    else:
+        judge_fallback_models = ["openrouter/free"] if requested_judge_model != "openrouter/free" else []
     judge_chat_history = []
 
     generator_call_count = 0
@@ -328,24 +362,28 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
                 propagate_capacity_error=allow_fallback,
             )
 
-        can_fallback = not judge_fallback_used and getattr(openrouter, "model", None) != "openrouter/free"
-        try:
-            judgement = attempt(can_fallback)
-        except Exception as error:
-            reason = _llm_capacity_message(error)
-            if not can_fallback or reason is None:
-                raise
-            print(f"Judge is {reason}; switching to openrouter/free for the rest of this run.", flush=True)
+        while True:
             try:
-                fallback = OpenRouter(os.getenv("OPENROUTER_API_KEY"), model="openrouter/free")
-            except Exception as setup_error:
-                failure_context["failure_category"] = "judge_provider_error"
-                raise SystemExit(f"Cannot initialize fallback judge: {setup_error}") from None
-            fallback.messages = list(judge_chat_history)
-            fallback.resolved_models = list(getattr(openrouter, "resolved_models", []))
-            openrouter = fallback
-            judge_fallback_used = True
-            judgement = attempt(False)
+                judgement = attempt(bool(judge_fallback_models))
+                break
+            except Exception as error:
+                reason = _llm_capacity_message(error)
+                if not judge_fallback_models or reason is None:
+                    raise
+                if "free-models-per-day" in str(error) or "openrouter_free_tier_daily" in str(error):
+                    failure_context["failure_category"] = "rate_limit"
+                    raise SystemExit(f"Judge LLM is rate limited by OpenRouter's daily account quota. Details: {error}") from None
+                fallback_model = judge_fallback_models.pop(0)
+                print(f"Judge is {reason}; switching to {fallback_model} for the rest of this run.", flush=True)
+                try:
+                    fallback = OpenRouter(os.getenv("OPENROUTER_API_KEY"), model=fallback_model)
+                except Exception as setup_error:
+                    failure_context["failure_category"] = "judge_provider_error"
+                    raise SystemExit(f"Cannot initialize fallback judge: {setup_error}") from None
+                fallback.messages = list(judge_chat_history)
+                fallback.resolved_models = list(getattr(openrouter, "resolved_models", []))
+                openrouter = fallback
+                judge_fallback_used = True
         judge_chat_history.extend([
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": judgement},
@@ -396,10 +434,9 @@ def _run_task(task_description, prompt, system_start, failure_context, gemini, o
             crm_validation_failures += 1
             return response, None, str(error), False
         desired_trace, environment_spec = trace, specification
-        items = collectible_count(specification)
-        if items >= MINIMUM_STEP_COLLECTIBLE_LIMIT:
+        if minimum_step_collectible_limit_reached(specification):
             baseline_error = (
-                f"Skipped minimum-step calculation: {items} collectible items "
+                f"Skipped minimum-step calculation: collectibles of a single type "
                 f"meet the {MINIMUM_STEP_COLLECTIBLE_LIMIT}-item threshold."
             )
             print(baseline_error + " Training will use the full episode budget and trace-only qualification.", flush=True)

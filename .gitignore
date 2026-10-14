@@ -4,6 +4,14 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # Credentials and local configuration
 .env
@@ -15,6 +23,8 @@ LLMs.txt
 .codex/
 .agents/
 .vscode/
+.local_archive/
+.local_archive/
 *.pem
 *.key
 
@@ -26,3 +36,15 @@ mlflow.db*
 *.db
 *.db-wal
 *.db-shm
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+~$*
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+*.swp
+~$*

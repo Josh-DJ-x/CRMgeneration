@@ -1,9 +1,4 @@
-"""Offline test for the ``system_codex`` compatibility entry point.
-
-``system_codex`` deliberately contains no loop logic. It should expose the
-same injectable ``main`` function as ``system_loop`` so either entry point
-uses the tested orchestration code.
-"""
+"""Offline checks for the command-line entry point and comparison modes."""
 
 import sys
 import unittest
@@ -19,8 +14,16 @@ import system
 import system_loop
 
 
-class SystemCodexTests(unittest.TestCase):
-    def test_codex_entry_point_reexports_injectable_main(self):
+class SystemCLITests(unittest.TestCase):
+    def test_single_run_failure_returns_nonzero_with_clear_message(self):
+        for error in (SystemExit("Judge LLM failed: no completion choices"),
+                      RuntimeError("judge connection failed")):
+            with self.subTest(error=error), patch.object(system, "main", side_effect=error), \
+                 patch("builtins.print") as output:
+                self.assertEqual(system.cli([]), 1)
+                output.assert_called_once_with(f"Run stopped: {error}", flush=True)
+
+    def test_entry_point_reexports_injectable_main(self):
         self.assertIs(system.main, system_loop.main)
 
     def test_comparison_modes_prompt_once_and_run_all_settings(self):

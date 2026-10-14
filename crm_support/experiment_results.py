@@ -9,9 +9,9 @@ from pathlib import Path
 import pandas as pd
 from mlflow.tracking import MlflowClient
 from sqlalchemy.engine import make_url
-from failure_diagnostics import failure_reason
+from crm_support.failure_diagnostics import failure_reason
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 NUMERIC = [
     "iterations", "generator_call_count", "judge_call_count",
     "total_system_time_seconds", "overall_difficulty_score", "reward_efficiency",
@@ -72,7 +72,7 @@ def runtime_breakdown(row):
     return pd.DataFrame(values, columns=["Activity", "Seconds"])
 
 
-def judge_label(requested, resolved, calls=None):
+def judge_label(requested, resolved, calls=None, backend="openrouter"):
     """Keep requested routing separate from models reported by the responses."""
     if isinstance(resolved, str):
         try:
@@ -80,14 +80,58 @@ def judge_label(requested, resolved, calls=None):
         except (TypeError, ValueError):
             resolved = None
     if isinstance(resolved, list):
+        provider = {"openai": "OpenAI", "openai+openrouter": "OpenAI + OpenRouter"}.get(backend, "OpenRouter")
         if resolved:
-            return "OpenRouter (" + ", ".join(dict.fromkeys(resolved)) + ")"
+            return provider + " (" + ", ".join(dict.fromkeys(resolved)) + ")"
         if calls == 0:
-            return "OpenRouter (not called)"
-        return "OpenRouter (actual model not recorded)"
+            return provider + " (not called)"
+        return provider + " (actual model not recorded)"
     if str(requested).startswith("openrouter/"):
         return "OpenRouter (actual model not recorded)"
     return requested
+
+
+def overview_figure(frame, all_runs):
+    """Pair dark successes with light failures for each generator, across filters."""
+    import colorsys
+    import plotly.express as px
+
+    models = all_runs.sort_values(["started_at", "run_id"]).generator_model.astype(str).unique()
+    pairs = [
+        ("#2457A7", "#A9CDF5"), ("#24703C", "#ABE0B5"),
+        ("#6941A5", "#D3B8EF"), ("#A85B10", "#F5CEA0"),
+        ("#147575", "#A2DEDE"), ("#A33C79", "#EDB6D7"),
+    ]
+    colours, categories = {}, []
+    for index, model in enumerate(models):
+        if index < len(pairs):
+            dark, light = pairs[index]
+        else:
+            hue = (0.61 + index * 0.61803398875) % 1
+            def shade(lightness):
+                rgb = colorsys.hls_to_rgb(hue, lightness, 0.55)
+                return "#" + "".join(f"{round(channel * 255):02X}" for channel in rgb)
+            dark, light = shade(0.32), shade(0.80)
+        for outcome, colour in [("Success", dark), ("Failure", light), ("Unknown", "#808080")]:
+            label = f"{model} · {outcome}"
+            categories.append(label)
+            colours[label] = colour
+    points = frame.copy()
+    points["Generator / outcome"] = points.generator_model.astype(str) + " · " + points.outcome
+    figure = px.scatter(
+        points, x="overall_difficulty_score", y="total_system_time_seconds",
+        color="Generator / outcome", symbol="generator_model",
+        color_discrete_map=colours,
+        category_orders={"Generator / outcome": categories, "generator_model": list(models)},
+        hover_data=["task_description", "run_id", "outcome"],
+        labels={"overall_difficulty_score": "Difficulty score",
+                "total_system_time_seconds": "Total runtime (seconds)"},
+    )
+    # Plotly appends the symbol category to the colour category. The colour
+    # label already includes the generator, so remove that duplicate suffix.
+    for trace in figure.data:
+        trace.name = trace.name.rsplit(", ", 1)[0]
+    return figure
 
 
 def comparison_figure(frame, metric):
@@ -149,6 +193,18 @@ def difficulty_summary(frame, metric=None, groups=("generator_model",)):
     if metric is None:
         result["value"] = result["value"].fillna(0).astype(int)
     return result[columns]
+
+
+def balanced_success_summary(frame):
+    """Give every populated difficulty interval equal weight per model and setting."""
+    groups = ["generator_model", "specification_length", "iterative_mode"]
+    bins = difficulty_summary(frame, "success", groups)
+    populated = bins[bins.samples.gt(0)]
+    return populated.groupby(groups, observed=True, dropna=False).agg(
+        success_percentage=("value", "mean"),
+        difficulty_intervals=("value", "count"),
+        scored_runs=("samples", "sum"),
+    ).reset_index()
 
 
 def difficulty_figure(frame, metric, label, split_modes=False):
@@ -223,6 +279,26 @@ def delete_run(run_id, uri=None):
     client(uri).delete_run(run_id)
 
 
+def set_manual_failure(run_id, reason="", uri=None, clear=False):
+    """Mark any run as failed, or restore its original automatic outcome."""
+    api = client(uri)
+    run = api.get_run(run_id)
+    if clear:
+        for key in ("manual_outcome", "manual_failure_reason"):
+            if key in run.data.tags:
+                api.delete_tag(run_id, key)
+    else:
+        api.set_tag(run_id, "manual_failure_reason", reason.strip() or "Performance rejected during manual review.")
+        api.set_tag(run_id, "manual_outcome", "Failure")
+
+
+def set_manual_success(run_id, uri=None):
+    """Override any run as successful without changing recorded parameters."""
+    api = client(uri)
+    api.get_run(run_id)
+    api.set_tag(run_id, "manual_outcome", "Success")
+
+
 def backfill_failure_reasons(experiment_id, uri=None):
     """Fill only missing reasons on unsuccessful runs using their saved evidence."""
     api = client(uri)
@@ -261,6 +337,8 @@ def load_runs(experiment_id, uri=None):
         for run in page:
             rows.append({
                 **run.data.params, **run.data.metrics,
+                **{key: value for key, value in getattr(run.data, "tags", {}).items()
+                   if key in {"manual_outcome", "manual_failure_reason"}},
                 "run_id": run.info.run_id, "run_status": run.info.status,
                 "started_at": run.info.start_time,
             })
@@ -270,11 +348,37 @@ def load_runs(experiment_id, uri=None):
     frame = pd.DataFrame(rows)
     for field in ["task_id", "task_description", "generator_model", "judge_model",
                   "success_status", "failure_reason", "failure_category", "iterative", "long", "run_id",
-                  "run_status", "started_at"]:
+                  "run_status", "started_at", "manual_outcome", "manual_failure_reason"]:
         if field not in frame:
             frame[field] = pd.Series(index=frame.index, dtype="object")
     for field in NUMERIC:
         frame[field] = pd.to_numeric(frame.get(field, pd.Series(dtype=float)), errors="coerce")
+    # Task 123 and similar capped runs can borrow the newest older training
+    # metrics for their task description when no training occurred in the run.
+    for index, row in frame.iterrows():
+        capped = str(row.get("failure_reason", "")).startswith("Generator call limit reached")
+        task_123 = str(row.get("task_id", "")) == "123"
+        if not (capped or task_123):
+            continue
+        missing = row[["reward_efficiency", "step_efficiency"]].isna()
+        if not missing.any():
+            continue
+        same_task = frame["task_description"].eq(row["task_description"])
+        if task_123:
+            # Task IDs are assigned at session start, so session start order
+            # uses this task's prior training run as the latest candidate.
+            same_task = frame.index.to_series(index=frame.index).notna()
+        previous = frame.loc[
+            (frame.index != index)
+            & same_task
+            & (frame["started_at"] < row["started_at"])
+            & frame[["reward_efficiency", "step_efficiency"]].notna().any(axis=1)
+        ].sort_values(["started_at", "run_id"], ascending=[False, False])
+        if previous.empty:
+            continue
+        for metric in ("reward_efficiency", "step_efficiency"):
+            if pd.isna(row[metric]):
+                frame.at[index, metric] = previous.iloc[0][metric]
     frame["minimum_steps"] = frame["minimum_steps"].fillna(
         frame["environment_minimum_steps_to_complete_trace"].where(
             frame["environment_minimum_steps_to_complete_trace"].gt(0)
@@ -296,6 +400,15 @@ def load_runs(experiment_id, uri=None):
         )
     frame["started_at"] = pd.to_datetime(frame["started_at"], unit="ms", utc=True)
     frame["task_number"] = pd.to_numeric(frame["task_id"], errors="coerce").astype("Int64")
+    frame["automatic_success_status"] = frame["success_status"]
+    manual_failure = frame["manual_outcome"].eq("Failure")
+    frame.loc[manual_failure, "success_status"] = "False"
+    frame.loc[manual_failure, "failure_reason"] = frame.loc[manual_failure, "manual_failure_reason"].fillna("Performance rejected during manual review.")
+    frame.loc[manual_failure, "failure_category"] = "manual_review"
+    manual_success = frame["manual_outcome"].eq("Success")
+    frame.loc[manual_success, "success_status"] = "True"
+    frame.loc[manual_success, "failure_reason"] = None
+    frame.loc[manual_success, "failure_category"] = "none"
     frame["success"] = frame["success_status"].astype("string").str.lower().map(
         {"true": True, "false": False, "1": True, "0": False}
     ).astype("boolean")
@@ -308,10 +421,16 @@ def load_runs(experiment_id, uri=None):
     ).fillna("Long")  # Runs predating this parameter used the original specifications.
     for field in ["generator_model", "judge_model", "task_description"]:
         frame[field] = frame[field].fillna("Unknown")
+    # NVIDIA Build and OpenRouter's free endpoint serve the same generator.
+    # Group their experiments together while retaining the recorded ID.
+    frame["generator_model_requested"] = frame["generator_model"]
+    frame["generator_model"] = frame["generator_model"].replace({
+        "nvidia/nemotron-3-super-120b-a12b:free": "nvidia/nemotron-3-super-120b-a12b",
+    })
     frame["judge_model_requested"] = frame["judge_model"]
     frame["judge_model"] = frame.apply(
         lambda row: judge_label(row["judge_model_requested"], row.get("judge_models"),
-                                row["judge_call_count"]), axis=1
+                                row["judge_call_count"], row.get("judge_backend", "openrouter")), axis=1
     ) if not frame.empty else frame["judge_model"]
     return frame
 

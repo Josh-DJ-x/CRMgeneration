@@ -105,6 +105,8 @@ class Ollama(LLM):
 
 
 class Groq(LLM):
+    TPM_RETRY_DELAY_SECONDS = 60
+
     def __init__(self, api_key, model="openai/gpt-oss-120b"):
         if not api_key:
             raise ValueError(
@@ -113,13 +115,78 @@ class Groq(LLM):
         self.model = model
         self.client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=api_key)
         self.messages = []
+        self.last_successful_generation = None
+
+    @staticmethod
+    def _is_tpm_rate_limit(error):
+        """Identify Groq's request-too-large-for-TPM response."""
+        detail = str(error).lower()
+        return (
+            "tokens per minute" in detail
+            and ("rate_limit_exceeded" in detail or "error code: 413" in detail
+                 or getattr(error, "status_code", None) == 413)
+        )
+
+    def generate(self, prompt: str) -> str:
+        messages = self.messages + [{"role": "user", "content": prompt}]
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model, messages=messages, temperature=0
+            )
+        except Exception as error:
+            if not self._is_tpm_rate_limit(error):
+                raise
+
+            # Groq's TPM limit is rolling. Wait until a minute after the last
+            # successful generation before retrying this same request once.
+            now = time.monotonic()
+            reference = self.last_successful_generation or now
+            remaining = self.TPM_RETRY_DELAY_SECONDS - (now - reference)
+            if remaining > 0:
+                time.sleep(remaining)
+            response = self.client.chat.completions.create(
+                model=self.model, messages=messages, temperature=0
+            )
+        content = response.choices[0].message.content
+        self.messages = messages + [{"role": "assistant", "content": content}]
+        self.last_successful_generation = time.monotonic()
+        return content
+
+
+class Nvidia(LLM):
+    """NVIDIA Build hosted chat completions with task conversation history."""
+
+    def __init__(self, api_key, model="nvidia/nemotron-3-super-120b-a12b", reasoning_effort="high", max_tokens=16384):
+        if not api_key:
+            raise ValueError("NVIDIA_API_KEY is missing. Set it before running system.py.")
+        if reasoning_effort not in ("high", "low", "none"):
+            raise ValueError("NVIDIA reasoning effort must be 'high', 'low', or 'none'.")
+        self.reasoning_effort = reasoning_effort
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 32768:
+            raise ValueError("NVIDIA max_tokens must be an integer between 1 and 32768.")
+        self.max_tokens = max_tokens
+        self.model = model
+        self.client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=api_key)
+        self.messages = []
 
     def generate(self, prompt: str) -> str:
         messages = self.messages + [{"role": "user", "content": prompt}]
         response = self.client.chat.completions.create(
-            model=self.model, messages=messages, temperature=0
+            model=self.model, messages=messages, temperature=1.0,
+            top_p=0.95, max_tokens=self.max_tokens,
+            extra_body={"chat_template_kwargs": {
+                "enable_thinking": self.reasoning_effort != "none",
+                "low_effort": self.reasoning_effort == "low",
+            }},
         )
-        content = response.choices[0].message.content
+        if not response.choices:
+            raise RuntimeError(f"NVIDIA ({self.model}) returned no completion choices.")
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError(f"NVIDIA ({self.model}) reached the output token budget; answer is incomplete.")
+        content = choice.message.content
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"NVIDIA ({self.model}) returned no answer text.")
         self.messages = messages + [{"role": "assistant", "content": content}]
         return content
 
@@ -708,7 +775,7 @@ def validate_task_order(grid, task_trace, max_search_states=None, deadline=None)
 
 
 def validate_generated_grid(grid, spec, expected_wall_count=None, task_trace=None,
-                            task_order_deadline=None):
+                            task_order_deadline=None, independent_access=False):
     """
     Generic validation for a generated environment.
 
@@ -716,6 +783,9 @@ def validate_generated_grid(grid, spec, expected_wall_count=None, task_trace=Non
       - Object counts match the specification.
       - Every required object is reachable from A.
       - Goal is reachable from A.
+      - With independent_access, every collectible has access from the start
+        without crossing another collectible or the goal; bells and the goal
+        share that access region. Generation enables this stricter rule.
 
     Returns (valid, metadata).
     """
@@ -790,6 +860,25 @@ def validate_generated_grid(grid, spec, expected_wall_count=None, task_trace=Non
     # -------------------------------
     if goal not in distances:
         return False, "Goal unreachable."
+
+    # Keep all task objects accessible from a common region of ordinary cells.
+    # Existence of one valid trace is insufficient: collecting a different set
+    # of five coins must not strand the agent behind a sixth coin on its way
+    # to the next key. Blocking the goal also prevents premature goal events.
+    collectibles = set(objects["coins"])
+    collectibles.update(position for positions in objects["keys"].values()
+                        for position in positions)
+    if independent_access:
+        access_region = _safe_distances(grid, start, collectibles | {goal})
+        for row, col in sorted(collectibles | {goal}):
+            if not any((row + dr, col + dc) in access_region
+                       for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))):
+                return False, (
+                    f"Object {grid[row][col]} at ({row}, {col}) requires crossing "
+                    "another collectible or the goal."
+                )
+        if any(position not in access_region for position in objects["bells"]):
+            return False, "Bell requires crossing a collectible or the goal."
 
     if task_trace is not None and not validate_task_order(
         grid, task_trace, deadline=task_order_deadline
@@ -914,6 +1003,7 @@ def generate_gridworld(seed, environment_json, task_trace=None, max_attempts=100
             valid, metadata = validate_generated_grid(
                 grid, spec, wall_count, task_trace,
                 task_order_deadline=min(deadline, generation_time() + 2.0),
+                independent_access=True,
             )
         except EnvironmentGenerationError as error:
             generation_time()
@@ -1209,6 +1299,11 @@ def collectible_count(spec):
     return spec["coins"] + sum(spec["keys"].values())
 
 
+def minimum_step_collectible_limit_reached(spec):
+    """Skip route calculation only for 17+ coins or keys of one colour."""
+    return max([spec["coins"], *spec["keys"].values()]) >= MINIMUM_STEP_COLLECTIBLE_LIMIT
+
+
 def environment_difficulty(grid, spec, desired_trace=None, calculate_route=True):
 
     valid, metadata = validate_generated_grid(grid, spec)
@@ -1238,7 +1333,7 @@ def environment_difficulty(grid, spec, desired_trace=None, calculate_route=True)
         result["validation_error"] = metadata
 
     route = (shortest_valid_trace_events(grid, desired_trace)
-             if calculate_route and collectible_count(spec) < MINIMUM_STEP_COLLECTIBLE_LIMIT
+             if calculate_route and not minimum_step_collectible_limit_reached(spec)
              and valid and desired_trace else None)
     result["minimum_steps_to_complete_trace"] = len(route) if route is not None else None
 

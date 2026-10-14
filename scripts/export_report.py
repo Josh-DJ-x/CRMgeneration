@@ -6,7 +6,7 @@ import html
 import json
 from pathlib import Path
 
-from experiment_results import ROOT, experiments, load_runs, summarize
+from crm_support.experiment_results import ROOT, experiments, load_runs, summarize
 
 
 def markdown_table(frame):
@@ -51,7 +51,7 @@ def export_report(experiment="CRM GridWorld", destination=None, uri=None):
     sections = "## Recorded results\n\n" + description + "\n\n## Task and model comparisons\n\n"
     sections += markdown_table(summary.round(4)) + "\n\n## Individual runs\n\n" + markdown_table(runs[columns]) + "\n"
     (destination / "results.md").write_text(sections, encoding="utf-8")
-    template = (ROOT / "reports" / "report.qmd").read_text(encoding="utf-8")
+    template = (ROOT / "templates" / "report.qmd").read_text(encoding="utf-8")
     (destination / "report.qmd").write_text(template, encoding="utf-8")
     preview = """<!doctype html><html lang="en"><meta charset="utf-8">
 <title>CRM experiment results</title><style>

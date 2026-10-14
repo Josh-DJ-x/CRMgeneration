@@ -3,6 +3,13 @@
 
 def effective_failure_category(record):
     """Recognize historical environment errors logged with no specific category."""
+    reason = record.get("failure_reason")
+    if isinstance(reason, str):
+        diagnostic = reason.strip().lower()
+        if (diagnostic.startswith("judge llm failed: openrouter judge (")
+                and ("finish_reason='length'" in diagnostic
+                     or "reached the output token budget" in diagnostic)):
+            return "judge_output_budget"
     category = record.get("failure_category")
     if isinstance(category, str) and category.strip() not in {"", "other"}:
         return category
@@ -10,6 +17,8 @@ def effective_failure_category(record):
     if not isinstance(reason, str):
         return "other"
     reason = reason.strip().lower()
+    if reason.startswith("judge: typeerror: 'nonetype' object is not subscriptable"):
+        return "judge_provider_error"
     # Match concrete diagnostics, including their old stage/exception prefixes,
     # rather than arbitrary mentions of environment failures in other errors.
     for prefix in ("environment_generation: valueerror: ",
@@ -45,6 +54,13 @@ def failure_reason(record):
     parts = []
     if info.get("truncated"):
         parts.append(f"Evaluation reached the {info.get('steps', 'maximum')}-step limit without completion.")
+        minimum = record.get("minimum_steps", info.get("minimum_steps"))
+        try:
+            if float(minimum) > float(info.get("steps")):
+                parts.append(f"The shortest valid route requires {minimum} steps, exceeding the episode limit; "
+                             "more training cannot make this task fit within that limit.")
+        except (TypeError, ValueError):
+            pass
     if desired is not None and actual is not None and list(desired) != list(actual):
         prefix = 0
         for expected, observed in zip(desired, actual):
@@ -80,7 +96,7 @@ def failure_reason(record):
                                  f"must be greater than {float(threshold):.3f}.")
             except (TypeError, ValueError):
                 pass
-    else:
+    elif criterion != "trace_only":
         efficiency = record.get("reward_efficiency", info.get("reward_efficiency"))
         try:
             if float(efficiency) < 0.94:

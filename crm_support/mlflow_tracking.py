@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from failure_diagnostics import failure_reason
+from crm_support.failure_diagnostics import failure_reason
 
 
 DEFAULT_EXPERIMENT = "CRM GridWorld"
@@ -56,7 +56,8 @@ def _difficulty_metrics(specifications):
         "environment_required_object_count": environment["required_object_count"],
         "environment_hazard_count": environment["hazard_count"],
         "environment_wall_count": environment["wall_count"],
-        "environment_minimum_steps_to_complete_trace": environment.get("minimum_steps_to_complete_trace") or 0,
+        **({"environment_minimum_steps_to_complete_trace": environment["minimum_steps_to_complete_trace"]}
+           if environment.get("minimum_steps_to_complete_trace") is not None else {}),
         "crm_state_count": crm.get("states", 0),
         "crm_transition_count": crm.get("transitions", 0),
         "crm_counter_count": crm.get("counter_count", 0),
@@ -76,6 +77,9 @@ def log_generation_failure(record):
             "generator_model": record["generator_model"],
             "judge_model": record["judge_model"],
             "judge_models": json.dumps(record.get("judge_models", [])),
+            "generator_backend": record.get("generator_backend", "unknown"),
+            "judge_backend": record.get("judge_backend", "openrouter"),
+            "judge_fallback_used": record.get("judge_fallback_used", False),
             "iterative": record["iterative"],
             "long": record["long"],
             "failure_reason": failure_reason({**record, "success_status": False}),
@@ -86,6 +90,8 @@ def log_generation_failure(record):
             "iterations": record.get("iterations", 0),
         })
         mlflow.log_metrics({
+            **{key: record[key] for key in ("step_efficiency", "reward_efficiency")
+               if record.get(key) is not None},
             "total_system_time_seconds": record["total_system_time"],
             "average_generation_time_seconds": record["average_generation_time"],
             "crm_parse_fail_percentage": record.get("crm_parse_fail_percentage", 0.0),
@@ -124,6 +130,9 @@ def log_experiment_run(record, animation_path=None):
             "generator_model": record["generator_model"],
             "judge_model": record["judge_model"],
             "judge_models": json.dumps(record.get("judge_models", [])),
+            "generator_backend": record.get("generator_backend", "unknown"),
+            "judge_backend": record.get("judge_backend", "openrouter"),
+            "judge_fallback_used": record.get("judge_fallback_used", False),
             "iterative": record["iterative"],
             "long": record["long"],
             "training_episodes": record["training_episodes"],
@@ -138,13 +147,14 @@ def log_experiment_run(record, animation_path=None):
                 "performance_criterion", "training_step_efficiency_threshold",
                 "training_reward_efficiency_threshold",
                 "training_evaluation_interval",
+                "efficiency_baseline_available", "efficiency_baseline_error",
             ) if key in record},
             "iterations": record["iterations"],
             "generator_call_count": record["generator_call_count"],
             "judge_call_count": record["judge_call_count"],
             "timing_version": record.get("timing_version", "legacy-v1"),
         })
-        mlflow.log_metrics({
+        mlflow.log_metrics({key: value for key, value in {
             "average_training_time_seconds": record["average_training_time"],
             "average_grid_world_generation_time_seconds": record["average_grid_world_generation_time"],
             "average_generation_time_seconds": record["average_generation_time"],
@@ -159,7 +169,7 @@ def log_experiment_run(record, animation_path=None):
             **{key: record[key] for key in ("minimum_steps", "step_efficiency") if key in record},
             "reward_efficiency": record["reward_efficiency"],
             "crm_parse_fail_percentage": record["crm_parse_fail_percentage"],
-        })
+        }.items() if value is not None})
         if record.get("timing_breakdown"):
             mlflow.log_metrics(record["timing_breakdown"])
         mlflow.log_metrics(_difficulty_metrics(record["specifications"]))

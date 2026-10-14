@@ -6,18 +6,18 @@
 
 Each comparison run starts fresh; failed runs are logged and the next continues.
 All modes prompt for a task unless --task "your task" is supplied. Override the
-generator with --generator gemini|ollama|groq|openai|openrouter and choose its
+generator with --generator gemini|ollama|groq|openai|openrouter|nvidia and choose its
 exact ID with --generator-model. Override the judge with --judge-provider
 openrouter|openai and --judge-model. API keys come from environment variables;
 paid model IDs incur API charges. Local Ollama models must already be installed.
 
-Example: python system.py --generator openrouter --generator-model qwen/qwen3-32b
+Example: python system.py --generator openrouter
 Use python system.py --help for all options. Loop logic lives in system_loop.
 """
 
 import argparse
 
-from semantic_specifications import select_specifications
+from system_specifications import select_specifications
 from system_loop import main
 
 # Developer A/B toggle. False runs one generation/training/evaluation pass and
@@ -25,8 +25,13 @@ from system_loop import main
 ITERATIVE = True
 # Prompt-length A/B toggle. False selects every *_SHORT specification.
 long = True
-# Select "gemini", "ollama", "groq", "openai", or "openrouter".
-GENERATOR_LLM = "groq"
+# Select "gemini", "ollama", "groq", "openai", "openrouter", or "nvidia".
+GENERATOR_LLM = "gemini"
+# NVIDIA reasoning: "high" (full), "low" (less thinking), or "none" (disabled).
+NVIDIA_REASONING = "high"
+# NVIDIA output budget, including reasoning tokens (1 to 32768).
+NVIDIA_MAX_TOKENS = 32768
+OPENROUTER_GENERATOR_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 JUDGE_PROVIDER = "openrouter"
 
 # Pin the judge to a free reasoning model for consistent comparison runs.
@@ -37,7 +42,7 @@ JUDGE_LLM = "poolside/laguna-s-2.1:free"
 # google/gemma-4-31b-it:free
 # stealth/space-bunny-alpha
 # poolside/laguna-s-2.1:free
-# "openai/gpt-oss-120b:free"
+# openai/gpt-oss-120b:free
 
 def cli(argv=None):
     parser = argparse.ArgumentParser(description="Run a CRM task or compare run settings.")
@@ -46,16 +51,27 @@ def cli(argv=None):
         help="1: long/short with the configured ITERATIVE setting; "
              "2: long iterative, short iterative, long one-shot",
     )
-    parser.add_argument("--generator", choices=("gemini", "ollama", "groq", "openai", "openrouter"), default=GENERATOR_LLM)
+    parser.add_argument("--generator", choices=("gemini", "ollama", "groq", "openai", "openrouter", "nvidia"), default=GENERATOR_LLM)
     parser.add_argument("--generator-model", help="Exact generator model ID, e.g. qwen2.5:7b")
+    parser.add_argument("--nvidia-reasoning", choices=("high", "low", "none"),
+                        default=NVIDIA_REASONING, help="NVIDIA generator reasoning effort")
+    parser.add_argument("--nvidia-max-tokens", type=int, default=NVIDIA_MAX_TOKENS,
+                        help="NVIDIA output budget including reasoning (1 to 32768)")
     parser.add_argument("--judge-provider", choices=("openrouter", "openai"), default=JUDGE_PROVIDER)
     parser.add_argument("--judge-model", help="Exact judge model ID")
     parser.add_argument("--task", help="Task text; skip the interactive prompt")
     args = parser.parse_args(argv)
+    if args.generator == "nvidia" and not 1 <= args.nvidia_max_tokens <= 32768:
+        parser.error("--nvidia-max-tokens must be between 1 and 32768")
     options = {"generator_backend": args.generator,
                "judge_model": args.judge_model or (JUDGE_LLM if args.judge_provider == "openrouter" else "gpt-4.1")}
     if args.generator_model is not None:
         options["generator_model"] = args.generator_model
+    elif args.generator == "openrouter":
+        options["generator_model"] = OPENROUTER_GENERATOR_MODEL
+    if args.generator == "nvidia":
+        options["nvidia_reasoning"] = args.nvidia_reasoning
+        options["nvidia_max_tokens"] = args.nvidia_max_tokens
     if args.judge_provider != "openrouter":
         options["judge_backend"] = args.judge_provider
     if args.task is not None:

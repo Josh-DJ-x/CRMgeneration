@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from system_functions import (
     EnvironmentGenerationError, RouteSearchLimitError, calculate_trace_reward_bounds,
     generate_gridworld, shortest_valid_trace_events, validate_task_order,
+    validate_generated_grid,
 )
 
 
@@ -34,6 +35,37 @@ class EnvironmentGenerationTests(unittest.TestCase):
 
     def test_search_rejects_unavoidable_early_pickup(self):
         self.assertFalse(validate_task_order([list("ACEG")], ["GREEN_KEY", "COIN", "GOAL"]))
+
+    def test_generation_rejects_solvable_collectible_dependency(self):
+        # Either coin can be first, but only the entrance coin allows the key
+        # next. A solvable trace alone must not qualify this layout.
+        grid = [list(row) for row in ("ACB#", ".###", "C..G")]
+        spec = dict(self.spec, coins=2,
+                    keys=dict(self.spec["keys"], blue=1))
+        trace = ["COIN", "BLUE_KEY", "COIN", "GOAL"]
+        self.assertTrue(validate_task_order(grid, trace))
+        valid, reason = validate_generated_grid(
+            grid, spec, task_trace=trace, independent_access=True)
+        self.assertFalse(valid)
+        self.assertIn("requires crossing", reason)
+
+    def test_generation_accepts_independently_accessible_collectibles(self):
+        grid = [list(row) for row in ("ACB.", "....", "C..G")]
+        spec = dict(self.spec, coins=2,
+                    keys=dict(self.spec["keys"], blue=1))
+        self.assertTrue(validate_generated_grid(
+            grid, spec, task_trace=["COIN", "BLUE_KEY", "COIN", "GOAL"],
+            independent_access=True,
+        )[0])
+
+    def test_generation_rejects_bell_or_goal_behind_collectible(self):
+        for row, bells in (("ACSG", 1), ("ACG", 0)):
+            with self.subTest(row=row):
+                valid, reason = validate_generated_grid(
+                    [list(row)], dict(self.spec, coins=1, bells=bells),
+                    independent_access=True)
+                self.assertFalse(valid)
+                self.assertIn("requires crossing", reason)
 
     def test_order_search_has_state_and_time_limits(self):
         grid = [list("ACG")]
@@ -144,7 +176,7 @@ class EnvironmentGenerationTests(unittest.TestCase):
                  + ["GREEN_KEY"] + ["BELL"] * 12 + ["GOAL"])
         env = generate_gridworld(42, json.dumps(self.spec), trace)
         route = shortest_valid_trace_events(env.grid, trace)
-        self.assertEqual(len(route), 129)
+        self.assertEqual(len(route), 111)
         self.assertEqual([event for event in route if event], trace)
         crm = SimpleNamespace(
             u_0=0, c_0=(),
@@ -153,8 +185,8 @@ class EnvironmentGenerationTests(unittest.TestCase):
             _get_state_transition_function=lambda: {0: {"GOAL / (-)": -1}},
         )
         bounds = calculate_trace_reward_bounds(crm, trace, 200, env.grid)
-        self.assertEqual(bounds["shortest_valid_steps"], 129)
-        self.assertAlmostEqual(bounds["maximum_reward"], len(trace) - (129 - len(trace)) * 0.1)
+        self.assertEqual(bounds["shortest_valid_steps"], 111)
+        self.assertAlmostEqual(bounds["maximum_reward"], len(trace) - (111 - len(trace)) * 0.1)
 
 
 if __name__ == "__main__":

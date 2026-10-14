@@ -8,10 +8,10 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import mlflow_tracking
+from crm_support import mlflow_tracking
 import system_functions
 import system_loop
-from failure_diagnostics import failure_reason
+from crm_support.failure_diagnostics import failure_reason
 
 
 class StepEfficiencyTests(unittest.TestCase):
@@ -52,7 +52,9 @@ class StepEfficiencyTests(unittest.TestCase):
             (0.9, 1.0, False),
             (1.0, 0.9, False),
         ):
-            with self.subTest(steps=steps, rewards=rewards):
+            with (self.subTest(steps=steps, rewards=rewards),
+                  patch.object(system_loop, "TRAINING_STEP_EFFICIENCY_THRESHOLD", 0.95),
+                  patch.object(system_loop, "TRAINING_REWARD_EFFICIENCY_THRESHOLD", 0.94)):
                 self.assertEqual(system_loop._performance_passed({
                     "step_efficiency": steps, "reward_efficiency": rewards,
                 }), expected)

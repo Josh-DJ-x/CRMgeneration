@@ -50,7 +50,7 @@ ENVIRONMENT_CONTEXT = """
 ENVIRONMENT VARIABLE SPECIFICATION
 
 This applies to the `<<<ENVIRONMENT>>>` section in the first generation only. Specify
-the ABSOLUTE MINIMUM number of objects needed to make the task possible, describing WHAT must
+the minimum number of objects needed to make fully fulfill the task specification, describing WHAT must
 exist rather than WHERE. The Python environment generator decides all positions,
 walls, layout, and starting position.
 
@@ -299,7 +299,7 @@ Reject only unrelated/unsupported/contradictory/unachievable objectives: <<<INVA
 """
 
 ENVIRONMENT_CONTEXT_SHORT = """
-Initial ENVIRONMENT: ABSOLUTE MINIMUM counts of coins, red/blue/green/yellow keys, bells, hazards
+Initial ENVIRONMENT: ABSOLUTE MINIMUM counts of coins, red/blue/green/yellow keys, bells,
 for the entire trace. No coordinates/walls; Python chooses layout and agent start.
 """
 

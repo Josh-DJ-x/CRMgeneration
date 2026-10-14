@@ -8,18 +8,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import experiment_results as results
+from crm_support import experiment_results as results
 import system_loop
-from failure_diagnostics import failure_reason
-from mlflow_tracking import log_experiment_run, log_generation_failure
-from semantic_specifications import GENERATION_FORMAT_SHORT
+from crm_support.failure_diagnostics import failure_reason
+from crm_support.mlflow_tracking import log_experiment_run, log_generation_failure
+from system_specifications import GENERATION_FORMAT_SHORT
 from system_functions import crm_accepts_trace, crm_parse, extract_generation_trace
 
 
 class FailureReasonTests(unittest.TestCase):
     def test_crm_failure_percentage_counts_parse_and_alignment_failures_once(self):
         initial = ('<<<DESIRED_TRACE>>>\nGOAL\n<<<ENVIRONMENT>>>\n'
-                   '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0}}'
+                   '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0},"hazards":false}'
                    '\n<<<CRM>>>\ninvalid CRM')
         for parses, accepts, expected in [
             ([None, object(), object(), object()], [False, False, True], 75.0),
@@ -44,7 +44,7 @@ class FailureReasonTests(unittest.TestCase):
 
     def test_crm_failure_percentage_handles_missing_section_and_provider_failure(self):
         initial = ('<<<DESIRED_TRACE>>>\nGOAL\n<<<ENVIRONMENT>>>\n'
-                   '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0}}'
+                   '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0},"hazards":false}'
                    '\n<<<CRM>>>\ninvalid CRM')
         for correction in ["Missing CRM section", RuntimeError("network unavailable")]:
             with self.subTest(correction=correction), \
@@ -68,13 +68,14 @@ class FailureReasonTests(unittest.TestCase):
               patch.object(system_loop, "log_generation_failure") as log_failure):
             with self.assertRaises(SystemExit):
                 system_loop.main(gemini=SimpleNamespace(generate=lambda prompt: response),
-                                 openrouter=SimpleNamespace())
+                                 openrouter=SimpleNamespace(), iterative=False)
         log_failure.assert_called_once()
         record = log_failure.call_args.args[0]
-        self.assertEqual(record["failure_stage"], "initial generation validation")
+        self.assertEqual(record["failure_stage"], "CRM correction validation")
         self.assertEqual(record["crm_parse_fail_percentage"], 100.0)
         self.assertEqual(record["generation_history"], [
-            {"call": 1, "kind": "initial", "response": response},
+            {"call": call, "kind": "initial" if call == 1 else "correction or refinement", "response": response}
+            for call in range(1, 5)
         ])
 
     def test_task5_first_bell_must_also_decrement_counter(self):

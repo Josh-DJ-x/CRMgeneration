@@ -5,12 +5,21 @@ import json
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from failure_diagnostics import effective_failure_category
+from crm_support.failure_diagnostics import effective_failure_category
 
-from experiment_results import (comparison_figure, experiments, load_artifacts, load_runs,
+from crm_support import experiment_results as results_module
+
+# A running Streamlit process can retain the module from before this helper
+# was added, even after rerunning the dashboard script.
+if not hasattr(results_module, "balanced_success_summary"):
+    import importlib
+    importlib.reload(results_module)
+
+from crm_support.experiment_results import (comparison_figure, overview_figure, experiments, load_artifacts, load_runs,
                                 summarize, trace_table, tracking_uri, database_path,
                                 database_snapshot, runtime_breakdown, delete_run,
-                                difficulty_figure, difficulty_distribution_figure)
+                                difficulty_figure, difficulty_distribution_figure, set_manual_failure, set_manual_success,
+                                balanced_success_summary)
 
 st.set_page_config(page_title="CRM experiment results", page_icon="🧭", layout="wide")
 st.title("CRM experiment results")
@@ -156,25 +165,74 @@ with overview:
     st.dataframe(overview_table, hide_index=True, width="stretch")
     chart_data = filtered.dropna(subset=["overall_difficulty_score", "total_system_time_seconds"])
     if not chart_data.empty:
-        figure = px.scatter(chart_data, x="overall_difficulty_score", y="total_system_time_seconds",
-                                   color="outcome", symbol="generator_model",
-                                   hover_data=["task_description", "run_id"],
-                                   labels={"overall_difficulty_score": "Difficulty score",
-                                           "total_system_time_seconds": "Total runtime (seconds)"})
+        figure = overview_figure(chart_data, runs)
         figure.update_xaxes(tick0=0, dtick=0.1, range=[0, 1], fixedrange=True,
                             tickformat=".1f", automargin=True)
         st.plotly_chart(figure, width="stretch")
-    st.caption("CRM failures include parsing and trace acceptance failures; percentages are averaged per run.")
-    st.metric("Mean CRM failure percentage", metric_value(filtered.crm_parse_fail_percentage.mean(), "%"))
+        st.caption("Each generator has its own colour pair: dark = success, light = failure; grey = unknown.")
+    st.subheader("Success per LLM across difficulty intervals")
+    st.caption("For each model and run setting, success is calculated within each 0.1-wide difficulty "
+               "interval, then averaged equally across intervals with recorded outcomes. Empty intervals, "
+               "unknown outcomes and runs without difficulty scores are excluded. Sidebar filters apply.")
+    balanced = balanced_success_summary(filtered)
+    for model in sorted(filtered.generator_model.unique()):
+        st.markdown(f"#### {model}")
+        setting_columns = st.columns(3)
+        for column, (title, length, mode) in zip(setting_columns, [
+            ("Long iterative", "Long", "Iterative"),
+            ("Short iterative", "Short", "Iterative"),
+            ("Long one-shot", "Long", "One-shot"),
+        ]):
+            with column:
+                st.markdown(f"##### {title}")
+                summary = balanced[(balanced.generator_model == model)
+                                   & (balanced.specification_length == length)
+                                   & (balanced.iterative_mode == mode)]
+                if summary.empty:
+                    st.metric("Success across difficulty intervals", "Unavailable")
+                    st.caption("No scored runs for this setting.")
+                else:
+                    score = summary.iloc[0]
+                    st.metric("Success across difficulty intervals", metric_value(score.success_percentage, "%"))
+                    st.caption(f"{int(score.difficulty_intervals)} difficulty intervals · {int(score.scored_runs)} scored runs")
 
-with detail:
-    lookup = filtered.set_index("run_id")
-    run_id = st.selectbox("Choose a run", filtered.run_id.tolist(),
-                         format_func=lambda rid: f"{lookup.loc[rid, 'task_description']} · {lookup.loc[rid, 'started_at']} · {rid[:8]}",
+def show_run_detail():
+    task_query = st.text_input(
+        "Search by task ID", key="detail_task_id",
+        help="Enter an exact task number, such as 61. Clear it to show all runs matching the sidebar filters.",
+    ).strip()
+    detail_runs = filtered
+    if task_query:
+        detail_runs = detail_runs[detail_runs.task_id.astype("string").eq(task_query).fillna(False)]
+    if detail_runs.empty:
+        st.info("No runs match this task ID and the sidebar filters.")
+        return
+    lookup = detail_runs.set_index("run_id")
+    if st.session_state.get("selected_task_run") not in detail_runs.run_id.tolist():
+        st.session_state.pop("selected_task_run", None)
+    run_id = st.selectbox("Choose a run", detail_runs.run_id.tolist(),
+                         format_func=lambda rid: f"Task {lookup.loc[rid, 'task_id']}: {lookup.loc[rid, 'task_description']} · {lookup.loc[rid, 'started_at']} · {rid[:8]}",
                          key="selected_task_run")
     row = lookup.loc[run_id]
     st.subheader(row.task_description)
     st.caption(f"Task {row.task_id} · {row.iterative_mode} · {row.specification_length} specifications · {row.outcome} · Generator: {row.generator_model} · Judge: {row.judge_model} · Run: {run_id}")
+    if row.get("performance_criterion") == "trace_only":
+        st.info("Shortest-route baseline unavailable. This run trained for the full episode budget; "
+                "its automatic outcome uses the trace check only. Both efficiency scores are unavailable.")
+    review_reason = st.text_input("Manual review reason (optional, for failure)", key=f"review_reason_{run_id}")
+    mark_success = row.outcome != "Success"
+    if st.button("Mark as Success" if mark_success else "Mark as Failure",
+                 key="manual_task_failure"):
+        try:
+            if mark_success:
+                set_manual_success(run_id, uri)
+            else:
+                set_manual_failure(run_id, review_reason, uri, clear=False)
+        except Exception as error:
+            st.error(f"Cannot save manual review: {error}")
+        else:
+            st.cache_data.clear()
+            st.rerun()
     if st.button("Delete this task run", key="delete_task_run",
                  help=f"Delete only run {run_id} for task {row.task_id}."):
         try:
@@ -280,6 +338,9 @@ with detail:
                "artifacts": {k: v for k, v in artifacts.items() if k != "animations"}}
     st.download_button("Download run details (JSON)", json.dumps(details, indent=2),
                        file_name=f"{run_id}.json", mime="application/json")
+
+with detail:
+    show_run_detail()
 
 with plots:
     st.caption("Plots use the sidebar filters for LLM, Short/Long specifications, and Iterative/One-shot mode. "

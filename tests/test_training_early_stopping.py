@@ -62,7 +62,7 @@ class EarlyStoppingTests(unittest.TestCase):
                      "grid_progression": [], "bell_rings": []} for result in outcomes]
         generator = SimpleNamespace(generate=lambda prompt: (
             '<<<DESIRED_TRACE>>>\nGOAL\n<<<ENVIRONMENT>>>\n'
-            '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0}}'
+            '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0},"hazards":false}'
             '\n<<<CRM>>>\nfake CRM'))
 
         def training(env, **kwargs):
@@ -79,6 +79,8 @@ class EarlyStoppingTests(unittest.TestCase):
             patch("builtins.input", return_value="Reach the goal"),
             patch.object(system_loop, "TRAINING_EPISODES", 5000),
             patch.object(system_loop, "TRAINING_EVALUATION_INTERVAL", 1000),
+            patch.object(system_loop, "TRAINING_STEP_EFFICIENCY_THRESHOLD", 0.95),
+            patch.object(system_loop, "TRAINING_REWARD_EFFICIENCY_THRESHOLD", 0.94),
             patch.object(system_loop, "configure_tracking", return_value=None),
             patch.object(system_loop, "crm_parse", return_value=object()),
             patch.object(system_loop, "crm_accepts_trace", return_value=True),

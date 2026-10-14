@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import experiment_results as results
-from export_report import export_report
-from mlflow_tracking import configure_tracking, log_generation_failure, next_task_id
+from crm_support import experiment_results as results
+from scripts.export_report import export_report
+from crm_support.mlflow_tracking import configure_tracking, log_generation_failure, next_task_id
 
 
 class Page(list):
@@ -251,6 +251,91 @@ class ResultsTests(unittest.TestCase):
         self.assertEqual(summary.success_rate, 0.5)
         self.assertTrue(frame.reward_efficiency.isna().all())
 
+    def test_balanced_success_gives_equal_weight_to_intervals_and_splits_settings(self):
+        frame = results.pd.DataFrame([
+            *[{"generator_model": "A", "specification_length": "Long", "iterative_mode": "Iterative",
+               "overall_difficulty_score": 0.05, "success": True}] * 9,
+            {"generator_model": "A", "specification_length": "Long", "iterative_mode": "Iterative",
+             "overall_difficulty_score": 0.95, "success": False},
+            {"generator_model": "A", "specification_length": "Long", "iterative_mode": "Iterative",
+             "overall_difficulty_score": 0.45, "success": None},
+            {"generator_model": "A", "specification_length": "Long", "iterative_mode": "Iterative",
+             "overall_difficulty_score": None, "success": False},
+            {"generator_model": "A", "specification_length": "Short", "iterative_mode": "Iterative",
+             "overall_difficulty_score": 1.0, "success": True},
+            {"generator_model": "B", "specification_length": "Long", "iterative_mode": "One-shot",
+             "overall_difficulty_score": 0.05, "success": False},
+        ])
+        summary = results.balanced_success_summary(frame).set_index(
+            ["generator_model", "specification_length", "iterative_mode"])
+        long = summary.loc[("A", "Long", "Iterative")]
+        self.assertEqual(long.success_percentage, 50)
+        self.assertEqual(long.difficulty_intervals, 2)
+        self.assertEqual(long.scored_runs, 10)
+        self.assertEqual(summary.loc[("A", "Short", "Iterative"), "success_percentage"], 100)
+        self.assertEqual(summary.loc[("B", "Long", "One-shot"), "success_percentage"], 0)
+        self.assertTrue(results.balanced_success_summary(frame.iloc[0:0]).empty)
+
+    def test_trace_only_manual_failure_persists_without_changing_automatic_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uri = Path(directory).as_uri()
+            with patch.dict("os.environ", {"MLFLOW_ALLOW_FILE_STORE": "true"}):
+                api = results.client(uri)
+                eid = api.create_experiment("Manual review test")
+                rid = api.create_run(eid).info.run_id
+                for key, value in {"task_id": "17", "success_status": "True", "performance_criterion": "trace_only"}.items():
+                    api.log_param(rid, key, value)
+                results.set_manual_failure(rid, "Too slow for my criteria", uri)
+                row = results.load_runs(eid, uri).iloc[0]
+                self.assertEqual(row.outcome, "Failure")
+                self.assertEqual(row.failure_reason, "Too slow for my criteria")
+                self.assertEqual(row.failure_category, "manual_review")
+                self.assertEqual(api.get_run(rid).data.params["success_status"], "True")
+                self.assertTrue(results.pd.isna(row.step_efficiency))
+                self.assertTrue(results.pd.isna(row.reward_efficiency))
+                results.set_manual_failure(rid, uri=uri, clear=True)
+                self.assertEqual(results.load_runs(eid, uri).iloc[0].outcome, "Success")
+
+    def test_manual_success_and_failure_toggle_preserves_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            uri = Path(directory).as_uri()
+            with patch.dict("os.environ", {"MLFLOW_ALLOW_FILE_STORE": "true"}):
+                api = results.client(uri)
+                eid = api.create_experiment("Toggle any outcome")
+                rid = api.create_run(eid).info.run_id
+                api.log_param(rid, "success_status", "False")
+                api.log_param(rid, "failure_reason", "Original failure")
+                results.set_manual_success(rid, uri)
+                row = results.load_runs(eid, uri).iloc[0]
+                self.assertEqual(row.outcome, "Success")
+                self.assertTrue(results.pd.isna(row.failure_reason))
+                self.assertEqual(api.get_run(rid).data.params["success_status"], "False")
+                results.set_manual_failure(rid, "Reviewed failure", uri)
+                row = results.load_runs(eid, uri).iloc[0]
+                self.assertEqual(row.outcome, "Failure")
+                self.assertEqual(row.failure_reason, "Reviewed failure")
+                results.set_manual_failure(rid, uri=uri, clear=True)
+                self.assertEqual(results.load_runs(eid, uri).iloc[0].failure_reason, "Original failure")
+
+    def test_dashboard_offers_saved_manual_failure_for_trace_only_success(self):
+        from streamlit.testing.v1 import AppTest
+        frame = self.frame()
+        frame["performance_criterion"] = "trace_only"
+        frame["automatic_success_status"] = frame.success_status
+        frame.loc[1, "task_id"] = "17"
+        with (patch.object(results, "experiments", return_value=[("1", "test")]),
+              patch.object(results, "load_runs", new=lambda *args: frame.copy()),
+              patch.object(results, "load_artifacts", new=lambda *args: {"warnings": [], "animations": []}),
+              patch.object(results, "set_manual_failure") as review):
+            app = AppTest.from_file(str(results.ROOT / "dashboard.py"), default_timeout=30).run()
+            app.selectbox(key="selected_task_run").set_value("b").run()
+            self.assertEqual(len(app.exception), 0)
+            self.assertEqual(app.button(key="manual_task_failure").label, "Mark as Failure")
+            app.text_input(key="review_reason_b").set_value("Too slow").run()
+            app.button(key="manual_task_failure").click().run()
+            self.assertEqual(len(app.exception), 0)
+            review.assert_called_once_with("b", "Too slow", results.tracking_uri(), clear=False)
+
     def test_step_metrics_load_from_new_and_historical_runs(self):
         with patch.object(results, "client") as factory:
             factory.return_value.search_runs.return_value = Page([
@@ -299,7 +384,7 @@ class ResultsTests(unittest.TestCase):
     def test_snapshot_does_not_overwrite_and_escapes_html(self):
         frame = self.frame()
         frame.loc[0, "task_description"] = "<script>alert(1)</script>"
-        with tempfile.TemporaryDirectory() as directory, patch("export_report.experiments", return_value=[("1", "test")]), patch("export_report.load_runs", return_value=frame):
+        with tempfile.TemporaryDirectory() as directory, patch("scripts.export_report.experiments", return_value=[("1", "test")]), patch("scripts.export_report.load_runs", return_value=frame):
             target = Path(directory) / "snapshot"
             export_report("test", target)
             self.assertTrue((target / "report.qmd").exists())
@@ -390,6 +475,23 @@ class ResultsTests(unittest.TestCase):
             "Shortest-route search reached its search limit; a valid environment may still exist.",
         ]
         frame = results.pd.concat([frame, environment_failures], ignore_index=True)
+        judge_failures = frame.iloc[:2].copy()
+        judge_failures["run_id"] = list("jk")
+        judge_failures["failure_category"] = ["judge_provider_error", "other"]
+        judge_failures["failure_reason"] = [
+            "Judge LLM failed: no completion choices",
+            "judge: TypeError: 'NoneType' object is not subscriptable",
+        ]
+        frame = results.pd.concat([frame, judge_failures], ignore_index=True)
+        budget_failures = frame.iloc[:2].copy()
+        budget_failures["run_id"] = list("lm")
+        budget_failures["failure_category"] = ["judge_output_budget", "judge_provider_error"]
+        budget_failures["failure_reason"] = [
+            "Judge output token budget exhausted",
+            "Judge LLM failed: OpenRouter judge (openrouter/free) reached the output token budget "
+            "(16384 tokens; finish_reason='length').",
+        ]
+        frame = results.pd.concat([frame, budget_failures], ignore_index=True)
 
         def fake_runs(*args):
             return frame
@@ -403,16 +505,16 @@ class ResultsTests(unittest.TestCase):
             app = AppTest.from_file(str(results.ROOT / "dashboard.py"), default_timeout=30).run()
             self.assertEqual(len(app.exception), 0)
             self.assertFalse(app.sidebar.toggle[0].value)
-            self.assertEqual(app.metric[0].value, "9")
+            self.assertEqual(app.metric[0].value, "13")
             app.sidebar.toggle[0].set_value(True).run()
             self.assertEqual(len(app.exception), 0)
-            self.assertEqual(app.dataframe[0].value.run_id.tolist(), list("df"))
-            self.assertEqual(app.metric[0].value, "2")
-            self.assertEqual(app.metric[1].value, "50.00%")
+            self.assertEqual(app.dataframe[0].value.run_id.tolist(), list("dflm"))
+            self.assertEqual(app.metric[0].value, "4")
+            self.assertEqual(app.metric[1].value, "25.00%")
             app.sidebar.multiselect[2].set_value(["Failure"]).run()
-            self.assertEqual(app.dataframe[0].value.run_id.tolist(), list("d"))
+            self.assertEqual(app.dataframe[0].value.run_id.tolist(), list("dlm"))
             app.sidebar.toggle[0].set_value(False).run()
-            self.assertEqual(app.dataframe[0].value.run_id.tolist(), list("abcdeghi"))
+            self.assertEqual(app.dataframe[0].value.run_id.tolist(), list("abcdeghijklm"))
 
     def test_dashboard_hides_historical_environment_failures_for_tasks_52_and_57(self):
         from streamlit.testing.v1 import AppTest

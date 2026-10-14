@@ -20,13 +20,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import system_loop
-import semantic_specifications as prompt_specs
-from semantic_specifications import GENERATION_FORMAT, GENERATION_FORMAT_SHORT
+import system_specifications as prompt_specs
+from system_specifications import GENERATION_FORMAT, GENERATION_FORMAT_SHORT
 from system_functions import (
     Gemini,
     Groq,
     Ollama,
     OpenRouter,
+    OpenRouterResponseError,
     EnvironmentGenerationError,
     RouteSearchLimitError,
     combined_difficulty,
@@ -54,6 +55,45 @@ class FakeLLM:
 
 
 class SystemLoopTests(unittest.TestCase):
+    def test_openrouter_rejects_partial_length_limited_answer_without_saving_it(self):
+        with patch("system_functions.OpenAI") as factory, \
+             patch.dict("os.environ", {"OPENROUTER_MAX_TOKENS": "8192"}):
+            create = factory.return_value.chat.completions.create
+            create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="<<<REFLECTION>>>unfinished"), finish_reason="length")])
+            judge = OpenRouter("test-key")
+            with self.assertRaises(OpenRouterResponseError) as raised:
+                judge.generate("evaluate")
+            self.assertEqual(raised.exception.finish_reason, "length")
+            self.assertEqual(create.call_args.kwargs["max_tokens"], 16384)
+            self.assertEqual(judge.messages, [])
+
+    def test_openrouter_rejects_missing_choices_and_empty_answers_without_polluting_history(self):
+        for response, diagnostic in [
+            (SimpleNamespace(choices=None), "no completion choices"),
+            (SimpleNamespace(choices=[]), "no completion choices"),
+            (SimpleNamespace(choices=[SimpleNamespace(message=None)]), "no answer text"),
+            (SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=" "), finish_reason="length")]), "token budget"),
+        ]:
+            with self.subTest(diagnostic=diagnostic), patch("system_functions.OpenAI") as factory:
+                factory.return_value.chat.completions.create.return_value = response
+                judge = OpenRouter("test-key")
+                with self.assertRaisesRegex(OpenRouterResponseError, diagnostic):
+                    judge.generate("evaluate")
+                self.assertEqual(judge.messages, [])
+                self.assertEqual(judge.resolved_models, [])
+
+    def test_openrouter_surfaces_error_body_and_status(self):
+        with patch("system_functions.OpenAI") as factory:
+            factory.return_value.chat.completions.create.return_value = SimpleNamespace(
+                choices=None, error={"code": 503, "message": "Provider unavailable"})
+            judge = OpenRouter("test-key")
+            with self.assertRaisesRegex(OpenRouterResponseError, "503.*Provider unavailable") as raised:
+                judge.generate("evaluate")
+            self.assertEqual(raised.exception.status_code, 503)
+            self.assertEqual(judge.messages, [])
+
     def test_openrouter_records_model_for_each_response(self):
         with patch("system_functions.OpenAI") as client_type:
             client = client_type.return_value
@@ -70,6 +110,11 @@ class SystemLoopTests(unittest.TestCase):
         self.assertEqual(judge.resolved_models, ["vendor/model-a", "vendor/model-b"])
         self.assertEqual(judge.last_response_model, "vendor/model-b")
         self.assertEqual(client.chat.completions.create.call_args.kwargs["messages"], [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "two"},
+        ])
+        self.assertEqual(judge.messages, [
             {"role": "user", "content": "one"},
             {"role": "assistant", "content": "first"},
             {"role": "user", "content": "two"},
@@ -181,25 +226,25 @@ class SystemLoopTests(unittest.TestCase):
         gemini_type.assert_not_called()
         ollama_type.assert_called_once_with(model="my-local-model")
 
-    def test_invalid_compact_trace_stops_without_verification_retries(self):
+    def test_invalid_compact_trace_gets_three_corrections_in_one_shot_mode(self):
         generation = re.sub(
             r"(<<<DESIRED_TRACE>>>\s*)[^\n]+",
             lambda match: match.group(1) + "COIN x 0 -> GOAL",
             GENERATION_FORMAT,
             count=1,
         )
-        generator = FakeLLM([generation])
+        generator = FakeLLM([generation] * 4)
         with (
             patch("builtins.input", return_value="Collect five coins."),
             patch.object(system_loop, "configure_tracking", return_value=None),
             patch.object(system_loop, "log_generation_failure") as log_failure,
         ):
             with self.assertRaisesRegex(SystemExit, "positive_count"):
-                system_loop.main(gemini=generator, openrouter=FakeLLM())
-        self.assertEqual(len(generator.prompts), 1)
+                system_loop.main(gemini=generator, openrouter=FakeLLM(), iterative=False)
+        self.assertEqual(len(generator.prompts), 4)
         record = log_failure.call_args.args[0]
         self.assertNotIn("trace_verification_failures", record)
-        self.assertEqual(record["generator_call_count"], 1)
+        self.assertEqual(record["generator_call_count"], 4)
 
     def test_provider_capacity_errors_exit_cleanly(self):
         class ProviderError(Exception):
@@ -228,7 +273,7 @@ class SystemLoopTests(unittest.TestCase):
     def test_unrelated_llm_error_is_not_hidden(self):
         self.assertIsNone(system_loop._llm_capacity_message(ValueError("invalid response")))
 
-    def test_environment_generation_limit_exits_cleanly(self):
+    def test_environment_generation_failure_gets_three_repairs_in_one_shot(self):
         with (
             patch("builtins.input", return_value="Collect five coins."),
             patch.object(system_loop, "configure_tracking", return_value=None),
@@ -236,16 +281,16 @@ class SystemLoopTests(unittest.TestCase):
             patch.object(system_loop, "train_agent") as train,
             patch.object(system_loop, "log_generation_failure") as log_failure,
         ):
-            with self.assertRaisesRegex(SystemExit, "Environment generation stopped: time limit") as raised:
-                system_loop.main(gemini=FakeLLM([GENERATION_FORMAT]), openrouter=FakeLLM())
-        self.assertTrue(raised.exception.__suppress_context__)
+            generator = FakeLLM([GENERATION_FORMAT] * 4)
+            with self.assertRaisesRegex(SystemExit, "after three corrections.*time limit"):
+                system_loop.main(gemini=generator, openrouter=FakeLLM(), iterative=False)
+        self.assertEqual(len(generator.prompts), 4)
         train.assert_not_called()
         log_failure.assert_called_once()
-        self.assertEqual(log_failure.call_args.args[0]["failure_category"], "environment_generation_limit")
+        self.assertIn("EnvironmentGenerationError", log_failure.call_args.args[0]["failure_reason"])
 
     def test_reward_bound_route_failures_exit_cleanly_with_distinct_categories(self):
         for error, category in (
-            (RouteSearchLimitError("Search limit; a valid environment may still exist."), "route_search_limit"),
             (ValueError("No ordered route exists for the desired trace."), "no_valid_environment"),
         ):
             with (
@@ -260,14 +305,16 @@ class SystemLoopTests(unittest.TestCase):
                 patch.object(system_loop, "log_generation_failure") as log_failure,
             ):
                 with self.assertRaises(SystemExit) as raised:
-                    system_loop.main(gemini=FakeLLM([GENERATION_FORMAT]), openrouter=FakeLLM())
-                self.assertTrue(raised.exception.__suppress_context__)
+                    system_loop.main(gemini=FakeLLM([GENERATION_FORMAT] * 4), openrouter=FakeLLM(), iterative=False)
                 train.assert_not_called()
                 log_failure.assert_called_once()
-                self.assertEqual(log_failure.call_args.args[0]["failure_category"], category)
-                self.assertEqual(log_failure.call_args.args[0]["failure_stage"], "evaluation reward bounds")
+                if isinstance(error, RouteSearchLimitError):
+                    self.assertEqual(log_failure.call_args.args[0]["failure_category"], category)
+                    self.assertEqual(log_failure.call_args.args[0]["failure_stage"], "evaluation reward bounds")
+                else:
+                    self.assertIn("after three corrections", str(raised.exception))
 
-    def test_invalid_environment_exits_cleanly_and_logs_failure(self):
+    def test_invalid_environment_one_shot_gets_corrections_before_logging_failure(self):
         for changes in ({"coins": 100}, {"hazards": "true"}):
             with self.subTest(changes=changes):
                 trace, crm, environment = extract_generation_trace(
@@ -276,7 +323,7 @@ class SystemLoopTests(unittest.TestCase):
                 spec = json.loads(environment)
                 spec.update(changes)
                 generation = GENERATION_FORMAT.replace(environment, json.dumps(spec))
-                generator = FakeLLM([generation])
+                generator = FakeLLM([generation] * 4)
                 judge = FakeLLM()
                 with (
                     patch("builtins.input", return_value="Collect five coins."),
@@ -286,18 +333,16 @@ class SystemLoopTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(
                         SystemExit,
-                        "Environment generation failed: Invalid environment specification",
+                        "after three corrections.*Invalid environment specification",
                     ) as raised:
-                        system_loop.main(gemini=generator, openrouter=judge)
-                self.assertTrue(raised.exception.__suppress_context__)
+                        system_loop.main(gemini=generator, openrouter=judge, iterative=False)
                 train.assert_not_called()
-                self.assertEqual(len(generator.prompts), 1)
+                self.assertEqual(len(generator.prompts), 4)
                 self.assertEqual(judge.prompts, [])
                 log_failure.assert_called_once()
                 record = log_failure.call_args.args[0]
-                self.assertEqual(record["failure_category"], "invalid_environment")
-                self.assertEqual(record["failure_stage"], "environment_generation")
-                self.assertIn("Task stopped before training", record["failure_reason"])
+                self.assertEqual(record["failure_stage"], "CRM correction validation")
+                self.assertIn("after three corrections", record["failure_reason"])
                 self.assertEqual(record["generation_history"][0]["response"], generation)
 
     def test_empty_task_is_rejected_without_llm_calls(self):
@@ -504,7 +549,7 @@ class SystemLoopTests(unittest.TestCase):
             return call
 
         initial = ('<<<DESIRED_TRACE>>>\nGOAL\n<<<ENVIRONMENT>>>\n'
-                   '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0}}'
+                   '{"coins":0,"bells":0,"keys":{"red":0,"blue":0,"green":0,"yellow":0},"hazards":false}'
                    '\n<<<CRM>>>\ninvalid CRM')
         class TimedGenerator:
             def generate(self, prompt):

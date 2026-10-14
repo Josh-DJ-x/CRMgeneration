@@ -1,0 +1,43 @@
+---
+title: "GridWorld CRM: Experimental Evaluation"
+format:
+  html:
+    toc: true
+    embed-resources: true
+  docx: default
+  pdf: default
+---
+
+## Research question
+
+*Describe the hypothesis and the behaviour being evaluated.*
+
+## Methodology
+
+*Document task selection, model versions, prompts, training configuration,
+random seeds, repetitions, stopping criteria, and the definition of success.*
+
+*State whether each group used iterative or one-shot execution. Report the
+number of runs with recorded outcomes used as the success-rate denominator.*
+
+*For the prompt-length comparison, report Long versus Short specifications,
+hold the task and training settings constant, and use repeated matched trials.*
+
+{{< include results.md >}}
+
+## Case studies
+
+*Select a successful run and a failure from the dashboard. Record their run IDs,
+compare desired and actual event sequences, and discuss judge feedback. Add
+downloaded animations for HTML or still images for PDF/Word.*
+
+## Interpretation and limitations
+
+*Explain observed differences and failure modes. Report sample counts and
+variation across repeated trials before drawing model-level conclusions.*
+
+The snapshot preserves run IDs in `provenance.json`, individual results in
+`runs.csv`, and grouped results in `comparison.csv`. It includes recorded runs
+only; tasks that terminated before logging are not represented. Historical runs
+may lack artifacts or metrics. Current runs preserve generation and iteration
+histories as well as final traces, judge feedback, and the final animation.
